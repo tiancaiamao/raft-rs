@@ -36,6 +36,7 @@ pub fn parse_conf_change(s: &str) -> Result<Vec<ConfChangeSingle>, String> {
             'v' => ConfChangeType::AddNode,
             'l' => ConfChangeType::AddLearnerNode,
             'r' => ConfChangeType::RemoveNode,
+            'w' => ConfChangeType::AddWitness,
             _ => return Err(format!("unknown token {tok}")),
         });
         cc.node_id = match chars.as_str().parse() {
@@ -58,6 +59,7 @@ pub fn stringify_conf_change(ccs: &[ConfChangeSingle]) -> String {
             ConfChangeType::AddNode => s.push('v'),
             ConfChangeType::AddLearnerNode => s.push('l'),
             ConfChangeType::RemoveNode => s.push('r'),
+            ConfChangeType::AddWitness => s.push('w'),
         }
         write!(&mut s, "{}", cc.node_id).unwrap();
     }

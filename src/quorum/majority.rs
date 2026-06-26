@@ -123,6 +123,72 @@ impl Configuration {
         }
     }
 
+    /// Returns the committed index at position quorum-1 (i.e., the index that
+    /// q-1 voters have acknowledged). This is used by Extended Raft to determine
+    /// when to trigger shortcut replication to a witness.
+    ///
+    /// Eg. If the matched indexes are `[2,2,2,4,5]` and n=5, quorum=3, then
+    /// quorum-1=2, and the result is `srt[n - n/2] = srt[5-2] = srt[3]`.
+    pub fn one_less_than_quorum(&self, l: &impl AckedIndexer) -> u64 {
+        let n = self.voters.len();
+        if n == 0 {
+            return u64::MAX;
+        }
+
+        let mut stack_arr: [MaybeUninit<Index>; 7] = unsafe { MaybeUninit::uninit().assume_init() };
+        let mut heap_arr;
+        let matched = if n <= 7 {
+            for (i, v) in self.voters.iter().enumerate() {
+                stack_arr[i] = MaybeUninit::new(l.acked_index(*v).unwrap_or_default());
+            }
+            unsafe { slice::from_raw_parts_mut(stack_arr.as_mut_ptr() as *mut _, n) }
+        } else {
+            let mut buf = Vec::with_capacity(n);
+            for v in &self.voters {
+                buf.push(l.acked_index(*v).unwrap_or_default());
+            }
+            heap_arr = Some(buf);
+            heap_arr.as_mut().unwrap().as_mut_slice()
+        };
+        // Sort descending: matched[0] = highest index, matched[n-1] = lowest.
+        matched.sort_by(|a, b| b.index.cmp(&a.index));
+
+        // We want the index acked by (quorum - 1) voters.
+        // quorum = n/2 + 1, so quorum - 1 = n/2.
+        // In a descending-sorted array, the index acked by k voters is at position k-1.
+        // So position = n/2 - 1. For n <= 2, quorum-1 <= 1, so position 0 (the max).
+        let pos = if n <= 2 { 0 } else { n / 2 - 1 };
+        matched[pos].index
+    }
+
+    /// Same as `vote_result` but also returns how many more votes are needed to win.
+    /// The returned `usize` is only meaningful when the result is `VoteResult::Pending`.
+    pub fn vote_result_with_diff(
+        &self,
+        check: impl Fn(u64) -> Option<bool>,
+    ) -> (VoteResult, usize) {
+        if self.voters.is_empty() {
+            return (VoteResult::Won, 0);
+        }
+
+        let (mut yes, mut missing) = (0, 0);
+        for v in &self.voters {
+            match check(*v) {
+                Some(true) => yes += 1,
+                None => missing += 1,
+                _ => (),
+            }
+        }
+        let q = crate::majority(self.voters.len());
+        if yes >= q {
+            (VoteResult::Won, 0)
+        } else if yes + missing >= q {
+            (VoteResult::Pending, q - yes)
+        } else {
+            (VoteResult::Lost, 0)
+        }
+    }
+
     /// Takes a mapping of voters to yes/no (true/false) votes and returns
     /// a result indicating whether the vote is pending (i.e. neither a quorum of
     /// yes/no has been reached), won (a quorum of yes has been reached), or lost (a

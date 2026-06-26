@@ -66,6 +66,30 @@ impl Configuration {
         }
     }
 
+    /// Returns the index committed by quorum-1 voters in both halves.
+    pub fn one_less_than_quorum(&self, l: &impl AckedIndexer) -> u64 {
+        cmp::min(
+            self.incoming.one_less_than_quorum(l),
+            self.outgoing.one_less_than_quorum(l),
+        )
+    }
+
+    /// Same as vote_result but returns how many more votes are needed in each half.
+    /// The returned `[usize; 2]` is `[incoming_votes_needed, outgoing_votes_needed]`.
+    pub fn vote_result_with_diff(
+        &self,
+        check: impl Fn(u64) -> Option<bool> + Copy,
+    ) -> (VoteResult, [usize; 2]) {
+        let (i, i_diff) = self.incoming.vote_result_with_diff(check);
+        let (o, o_diff) = self.outgoing.vote_result_with_diff(check);
+        let result = match (i, o) {
+            (VoteResult::Won, VoteResult::Won) => VoteResult::Won,
+            (VoteResult::Lost, _) | (_, VoteResult::Lost) => VoteResult::Lost,
+            _ => VoteResult::Pending,
+        };
+        (result, [i_diff, o_diff])
+    }
+
     /// Clears all IDs.
     pub fn clear(&mut self) {
         self.incoming.clear();

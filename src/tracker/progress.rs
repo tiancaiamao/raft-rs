@@ -53,6 +53,11 @@ pub struct Progress {
 
     /// Committed index in raft_log
     pub committed_index: u64,
+
+    /// IsWitness is true if this progress is tracked for a witness.
+    /// Witnesses are voters that participate in quorum but don't run
+    /// a full Raft instance. They receive entries via shortcut replication.
+    pub is_witness: bool,
 }
 
 impl Progress {
@@ -69,6 +74,7 @@ impl Progress {
             ins: Inflights::new(ins_size),
             commit_group_id: 0,
             committed_index: 0,
+            is_witness: false,
         }
     }
 

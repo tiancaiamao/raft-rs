@@ -177,6 +177,7 @@ impl Changer<'_> {
                 ConfChangeType::AddNode => self.make_voter(cfg, prs, cc.node_id),
                 ConfChangeType::AddLearnerNode => self.make_learner(cfg, prs, cc.node_id),
                 ConfChangeType::RemoveNode => self.remove(cfg, prs, cc.node_id),
+                ConfChangeType::AddWitness => self.make_witness(cfg, prs, cc.node_id),
             }
         }
         if cfg.voters().incoming.is_empty() {
@@ -231,6 +232,23 @@ impl Changer<'_> {
             cfg.learners_next.insert(id);
         } else {
             cfg.learners.insert(id);
+        }
+    }
+
+    /// Adds the given ID as a witness voter in the incoming config.
+    /// A witness is a voter that participates in quorum but does not run
+    /// a full Raft instance — it's accessed via shortcut replication.
+    fn make_witness(&self, cfg: &mut Configuration, prs: &mut IncrChangeMap, id: u64) {
+        // A witness is a voter, so add it to the incoming voters.
+        cfg.voters.incoming.insert(id);
+        cfg.learners.remove(&id);
+        cfg.learners_next.remove(&id);
+
+        // Track the witness ID in the configuration.
+        cfg.witnesses[0] = id;
+
+        if !prs.contains(id) {
+            self.init_progress(cfg, prs, id, false);
         }
     }
 

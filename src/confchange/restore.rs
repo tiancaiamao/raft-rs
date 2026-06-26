@@ -44,10 +44,12 @@ fn to_conf_change_single(cs: &ConfState) -> (Vec<ConfChangeSingle>, Vec<ConfChan
     for id in cs.get_voters_outgoing() {
         // If there are outgoing voters, first add them one by one so that the
         // (non-joint) config has them all.
-        outgoing.push(raft_proto::new_conf_change_single(
-            *id,
-            ConfChangeType::AddNode,
-        ));
+        let cc_type = if *id == cs.witness_outgoing {
+            ConfChangeType::AddWitness
+        } else {
+            ConfChangeType::AddNode
+        };
+        outgoing.push(raft_proto::new_conf_change_single(*id, cc_type));
     }
 
     // We're done constructing the outgoing slice, now on to the incoming one
@@ -62,10 +64,17 @@ fn to_conf_change_single(cs: &ConfState) -> (Vec<ConfChangeSingle>, Vec<ConfChan
     }
     // Then we'll add the incoming voters and learners.
     for id in cs.get_voters() {
-        incoming.push(raft_proto::new_conf_change_single(
-            *id,
-            ConfChangeType::AddNode,
-        ));
+        if *id == cs.witness {
+            incoming.push(raft_proto::new_conf_change_single(
+                *id,
+                ConfChangeType::AddWitness,
+            ));
+        } else {
+            incoming.push(raft_proto::new_conf_change_single(
+                *id,
+                ConfChangeType::AddNode,
+            ));
+        }
     }
     for id in cs.get_learners() {
         incoming.push(raft_proto::new_conf_change_single(

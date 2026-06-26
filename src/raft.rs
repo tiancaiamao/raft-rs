@@ -19,7 +19,7 @@ use std::ops::{Deref, DerefMut};
 
 use crate::eraftpb::{
     ConfChange, ConfChangeV2, ConfState, Entry, EntryType, HardState, Message, MessageType,
-    Snapshot,
+    Snapshot, WitnessMessage,
 };
 use raft_proto::protocompat::*;
 use raft_proto::ConfChangeI;
@@ -40,6 +40,7 @@ use crate::confchange::Changer;
 use crate::quorum::VoteResult;
 use crate::util;
 use crate::util::NO_LIMIT;
+use crate::HashMap;
 use crate::{confchange, Progress, ProgressState, ProgressTracker};
 
 // CAMPAIGN_PRE_ELECTION represents the first phase of a normal election when
@@ -265,6 +266,8 @@ pub struct Raft<T: Storage> {
 
     /// The list of messages.
     pub msgs: Vec<Message>,
+    /// Witness messages (separate channel for Extended Raft witness communication).
+    pub witness_msgs: Vec<WitnessMessage>,
     /// Internal raftCore.
     pub r: RaftCore<T>,
 }
@@ -330,6 +333,7 @@ impl<T: Storage> Raft<T> {
         let mut r = Raft {
             prs: ProgressTracker::with_capacity(voters.len(), learners.len(), c.max_inflight_msgs),
             msgs: Default::default(),
+            witness_msgs: Default::default(),
             r: RaftCore {
                 id: c.id,
                 read_states: Default::default(),
@@ -798,10 +802,11 @@ impl<T: Storage> RaftCore<T> {
         allow_empty: bool,
         msgs: &mut Vec<Message>,
     ) -> bool {
-        if pr.is_paused() {
+        // Witnesses don't receive regular AppendEntries — they use shortcut replication.
+        if pr.is_paused() || pr.is_witness {
             trace!(
                 self.logger,
-                "Skipping sending to {to}, it's paused",
+                "Skipping sending to {to}, it's paused or witness",
                 to = to;
                 "progress" => ?pr,
             );
@@ -928,15 +933,211 @@ impl<T: Storage> Raft<T> {
         let self_id = self.id;
         let core = &mut self.r;
         let msgs = &mut self.msgs;
+        let witness_msgs = &mut self.witness_msgs;
         self.prs
             .iter_mut()
             .filter(|&(id, _)| *id != self_id)
-            .for_each(|(id, pr)| core.send_heartbeat(*id, pr, ctx.clone(), msgs));
+            .for_each(|(id, pr)| {
+                if pr.is_witness {
+                    // Send witness heartbeat.
+                    let mut msg = WitnessMessage::default();
+                    msg.to = *id;
+                    msg.from = self_id;
+                    msg.msg_type = MessageType::MsgHeartbeat;
+                    msg.term = core.term;
+                    if let Some(ref context) = ctx {
+                        msg.context = context.clone().into();
+                    }
+                    witness_msgs.push(msg);
+                } else {
+                    core.send_heartbeat(*id, pr, ctx.clone(), msgs);
+                }
+            });
+    }
+
+    /// Sends entries to a witness via shortcut replication (Extended Raft).
+    /// Returns which config half (0=incoming, 1=outgoing) a witness belongs to.
+    fn witness_config_half(&self, witness_id: u64) -> Option<usize> {
+        let epoch = &self.prs().epoch;
+        for i in 0..2 {
+            if epoch.replication_sets[i].witness == witness_id {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    /// Called when q-1 voters in the replication set have acknowledged entries
+    /// up to `index`. The witness receives entries at most once per subterm.
+    fn send_append_to_witness(&mut self, witness_id: u64, _index: u64) {
+        let epoch = &self.prs.epoch;
+
+        // Send entries starting from the witness's match index + 1,
+        // not from the q-1 index (which may skip entries the witness hasn't seen).
+        let next_idx = self
+            .prs()
+            .get(witness_id)
+            .map(|pr| pr.matched + 1)
+            .unwrap_or(1);
+        let entries = self.raft_log.entries(
+            next_idx,
+            NO_LIMIT,
+            GetEntriesContext(GetEntriesFor::SendAppend {
+                to: witness_id,
+                term: self.term,
+                aggressively: false,
+            }),
+        );
+        let entries = match entries {
+            Ok(e) => e,
+            Err(Error::Store(StorageError::LogTemporarilyUnavailable)) => return,
+            Err(_) => return,
+        };
+        if entries.is_empty() {
+            return;
+        }
+
+        let first = &entries[0];
+        let mut msg = WitnessMessage::default();
+        msg.from = self.id;
+        msg.to = witness_id;
+        msg.msg_type = MessageType::MsgAppend;
+        msg.term = self.term;
+        msg.last_log_term = first.term;
+        msg.last_log_subterm = first.subterm;
+        msg.last_log_index = first.index;
+
+        // Include replication set info.
+        let r0 = &epoch.replication_sets[0];
+        let r1 = &epoch.replication_sets[1];
+        msg.replication_set_incoming = r0.non_witness_voters.iter().copied().collect();
+        if r0.excluded != r0.witness && r0.excluded != 0 {
+            msg.replication_set_incoming.push(r0.excluded);
+        }
+        msg.replication_set_outgoing = r1.non_witness_voters.iter().copied().collect();
+        if r1.excluded != r1.witness && r1.excluded != 0 {
+            msg.replication_set_outgoing.push(r1.excluded);
+        }
+
+        msg.entries = entries.into();
+
+        self.witness_msgs.push(msg);
+    }
+
+    /// Sends a RequestVote to a witness (Extended Raft).
+    /// Called when a candidate has q-1 regular votes and needs the witness to break the tie.
+    fn send_request_vote_to_witness(
+        &mut self,
+        witness_id: u64,
+        vote_msg_type: MessageType,
+        term: u64,
+    ) {
+        let last_index = self.raft_log.last_index();
+        let last_term = self.raft_log.last_term();
+
+        // Get the subterm of the last entry.
+        let last_subterm = self
+            .raft_log
+            .entries(last_index, 1, GetEntriesContext::empty(false))
+            .ok()
+            .and_then(|e| e.first().map(|entry| entry.subterm))
+            .unwrap_or(0);
+
+        let votes = self.prs.votes();
+        let mut msg = WitnessMessage::default();
+        msg.from = self.id;
+        msg.to = witness_id;
+        msg.msg_type = vote_msg_type;
+        msg.term = term;
+        msg.last_log_term = last_term;
+        msg.last_log_subterm = last_subterm;
+        msg.last_log_index = last_index;
+
+        // Include current vote state.
+        for (&id, &voted) in votes {
+            msg.vote_ids.push(id);
+            msg.vote_vals.push(voted);
+        }
+
+        self.witness_msgs.push(msg);
+    }
+
+    /// Determines which witnesses (if any) are ready to be asked for votes,
+    /// given how many more votes are needed in each config half.
+    /// Returns a map of witness_id → true for witnesses that should be polled.
+    fn get_witness_vote_request_readiness(&self, votes_to_win: [usize; 2]) -> HashMap<u64, bool> {
+        let v1 = votes_to_win[0];
+        let v2 = votes_to_win[1];
+        if v1 > 1 && v2 > 1 {
+            return HashMap::default();
+        }
+
+        let w1 = self.prs.conf().witnesses[0];
+        let w2 = self.prs.conf().witnesses[1];
+        if w1 == 0 && w2 == 0 {
+            return HashMap::default();
+        }
+
+        let mut result = HashMap::default();
+
+        if w1 == w2 {
+            // Same witness for both halves.
+            result.insert(w1, (v1 == 1 && v2 <= 1) || (v1 <= 1 && v2 == 1));
+        } else {
+            if w1 > 0 {
+                result.insert(w1, v1 == 1);
+            }
+            if w2 > 0 {
+                result.insert(w2, v2 == 1);
+            }
+        }
+
+        result
+    }
+
+    /// Returns true if any witness is configured.
+    fn has_witness(&self) -> bool {
+        self.prs.conf().witnesses[0] != 0 || self.prs.conf().witnesses[1] != 0
     }
 
     /// Attempts to advance the commit index. Returns true if the commit index
     /// changed (in which case the caller should call `r.bcast_append`).
+    ///
+    /// In Extended Raft, this also checks for shortcut replication opportunity:
+    /// when q-1 voters in a replication set have acked, send entries to the witness.
     pub fn maybe_commit(&mut self) -> bool {
+        // Extended Raft: check for shortcut replication to witnesses.
+        // This must happen before the commit check, because we need to send
+        // entries to the witness when q-1 acks are reached, even if the entry
+        // isn't committed yet.
+        let witness_indices = self.mut_prs().one_less_than_quorum_in_replication_set();
+        let current_subterm = self.prs().epoch.subterm;
+        for (witness_id, idx) in &witness_indices {
+            if *idx > 0 {
+                // Determine which config half this witness belongs to.
+                let half = self.witness_config_half(*witness_id);
+                if let Some(half) = half {
+                    let already_contacted =
+                        self.prs().epoch.witness_subterm[half] == current_subterm;
+                    if already_contacted {
+                        // Shortcut replication: synthesize the witness ack
+                        // without sending another RPC. The leader already
+                        // replicated to the witness this subterm.
+                        if let Some(pr) = self.mut_prs().get_mut(*witness_id) {
+                            if idx > &pr.matched {
+                                pr.matched = *idx;
+                                pr.state = ProgressState::Replicate;
+                            }
+                        }
+                    } else {
+                        // First contact this subterm: send actual entries.
+                        self.send_append_to_witness(*witness_id, *idx);
+                        self.mut_prs().epoch.witness_subterm[half] = current_subterm;
+                    }
+                }
+            }
+        }
+
         let mci = self.mut_prs().maximal_committed_index().0;
         if self.r.raft_log.maybe_commit(mci, self.r.term) {
             let (self_id, committed) = (self.id, self.raft_log.committed);
@@ -1046,13 +1247,44 @@ impl<T: Storage> Raft<T> {
         }
 
         let li = self.raft_log.last_index();
+        let subterm = self.prs.epoch.subterm;
         for (i, e) in es.iter_mut().enumerate() {
             e.term = self.term;
             e.index = li + 1 + i as u64;
+            e.subterm = subterm;
         }
         self.raft_log.append(es);
 
         // Not update self's pr.matched until on_persist_entries
+        true
+    }
+
+    /// Starts a new subterm by resetting/changing the replication set and
+    /// appending an empty entry. Called when:
+    /// - A new leader is elected (new_term=true, conf_change=false)
+    /// - A conf change is applied (new_term=false, conf_change=true)
+    /// - The leader detects liveness changes (new_term=false, conf_change=false)
+    ///
+    /// Returns true if a new subterm was started (and an empty entry appended).
+    pub fn maybe_start_new_subterm(&mut self, new_term: bool, conf_change: bool) -> bool {
+        if new_term || conf_change {
+            self.mut_prs().reset_replication_set(new_term);
+        } else if !self.mut_prs().change_replication_set() {
+            return false;
+        }
+
+        if !self.append_entry(&mut [Entry::default()]) {
+            // This won't happen because we just called reset() above.
+            panic!("appending an empty entry should never be dropped");
+        }
+
+        let subterm = self.prs.epoch.subterm;
+        debug!(
+            self.logger,
+            "started new subterm. Term: {}, Subterm: {}",
+            self.term,
+            subterm;
+        );
         true
     }
 
@@ -1263,9 +1495,12 @@ impl<T: Storage> Raft<T> {
         self.pending_conf_index = last_index;
 
         // No need to check result because append_entry never refuse entries
-        // which size is zero
-        if !self.append_entry(&mut [Entry::default()]) {
-            panic!("appending an empty entry should never be dropped")
+        // which size is zero.
+        if self.has_witness() {
+            // Extended Raft: also starts a new subterm (subterm=0 for new term).
+            self.maybe_start_new_subterm(true, false);
+        } else {
+            let _ = self.append_entry(&mut [Entry::default()]);
         }
 
         info!(
@@ -1300,9 +1535,14 @@ impl<T: Storage> Raft<T> {
         let mut voters = [0; 7];
         let mut voter_cnt = 0;
 
-        // Only send vote request to voters.
+        // Only send vote request to voters, but skip witnesses.
+        // Witnesses will be asked after the candidate gets q-1 regular votes.
         for id in self.prs.conf().voters().ids().iter() {
             if id == self_id {
+                continue;
+            }
+            // Skip witnesses in initial vote broadcast (Extended Raft).
+            if id == self.prs.conf().witnesses[0] || id == self.prs.conf().witnesses[1] {
                 continue;
             }
 
@@ -2050,6 +2290,11 @@ impl<T: Storage> Raft<T> {
                 return Ok(());
             }
             MessageType::MsgCheckQuorum => {
+                // Extended Raft: adjust replication set BEFORE check_quorum_active(),
+                // because check_quorum_active() resets recent_active flags.
+                if self.has_witness() {
+                    self.maybe_start_new_subterm(false, false);
+                }
                 if !self.check_quorum_active() {
                     warn!(
                         self.logger,
@@ -2199,6 +2444,15 @@ impl<T: Storage> Raft<T> {
                 self.handle_unreachable(&m);
             }
             MessageType::MsgTransferLeader => {
+                // Witnesses can't be leaders.
+                if self.prs().get(m.from).map_or(false, |pr| pr.is_witness) {
+                    debug!(
+                        self.logger,
+                        "{} is witness. Ignored transferring leadership",
+                        m.from;
+                    );
+                    return Ok(());
+                }
                 self.handle_transfer_leader(&m);
             }
             _ => {
@@ -2251,7 +2505,7 @@ impl<T: Storage> Raft<T> {
 
     fn poll(&mut self, from: u64, t: MessageType, vote: bool) -> VoteResult {
         self.prs.record_vote(from, vote);
-        let (gr, rj, res) = self.prs.tally_votes();
+        let (gr, rj, res, votes_to_win) = self.prs.tally_votes_with_diff();
         // Unlike etcd, we log when necessary.
         if from != self.id {
             info!(
@@ -2261,6 +2515,7 @@ impl<T: Storage> Raft<T> {
                 "from" => from,
                 "rejections" => rj,
                 "approvals" => gr,
+                "votes_to_win" => ?votes_to_win,
                 "type" => ?t,
                 "term" => self.term,
             );
@@ -2281,7 +2536,16 @@ impl<T: Storage> Raft<T> {
                 let term = self.term;
                 self.become_follower(term, INVALID_ID);
             }
-            VoteResult::Pending => (),
+            VoteResult::Pending => {
+                // Extended Raft: if we're close to winning (1 vote short),
+                // ask the witness to vote.
+                let witness_ready = self.get_witness_vote_request_readiness(votes_to_win);
+                for (&witness_id, &ready) in &witness_ready {
+                    if ready {
+                        self.send_request_vote_to_witness(witness_id, t, self.term);
+                    }
+                }
+            }
         }
         res
     }
@@ -2813,7 +3077,13 @@ impl<T: Storage> Raft<T> {
         };
         self.prs
             .apply_conf(cfg, changes, self.raft_log.last_index());
-        Ok(self.post_conf_change())
+        let new_cs = self.post_conf_change();
+        // Extended Raft: if leader and witnesses are configured,
+        // start a new subterm after conf change.
+        if self.state == StateRole::Leader && self.has_witness() {
+            self.maybe_start_new_subterm(false, true);
+        }
+        Ok(new_cs)
     }
 
     /// Returns a read-only reference to the progress set.

@@ -516,6 +516,7 @@ mod status;
 pub mod storage;
 mod tracker;
 pub mod util;
+pub mod witness;
 
 pub use crate::raft::{
     vote_resp_msg_type, Raft, SoftState, StateRole, CAMPAIGN_ELECTION, CAMPAIGN_PRE_ELECTION,
@@ -536,8 +537,10 @@ pub use raw_node::{LightReady, Peer, RawNode, Ready, SnapshotStatus};
 pub use read_only::{ReadOnlyOption, ReadState};
 pub use status::Status;
 pub use storage::{GetEntriesContext, RaftState, Storage};
+pub use tracker::{Epoch, ReplicationSet};
 pub use tracker::{Inflights, Progress, ProgressState, ProgressTracker};
 pub use util::majority;
+pub use witness::{Witness, WitnessResponse, WitnessStorage};
 
 pub mod prelude {
     //! A "prelude" for crates using the `raft` crate.

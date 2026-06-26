@@ -26,7 +26,9 @@ use raft_proto::protocompat::*;
 use raft_proto::ConfChangeI;
 use slog::Logger;
 
-use crate::eraftpb::{ConfState, Entry, EntryType, HardState, Message, MessageType, Snapshot};
+use crate::eraftpb::{
+    ConfState, Entry, EntryType, HardState, Message, MessageType, Snapshot, WitnessMessage,
+};
 use crate::errors::{Error, Result};
 use crate::read_only::ReadState;
 use crate::{config::Config, StateRole};
@@ -104,6 +106,9 @@ pub struct Ready {
     snapshot: Snapshot,
 
     is_persisted_msg: bool,
+
+    /// Witness messages to be sent to witnesses (Extended Raft).
+    witness_messages: Vec<WitnessMessage>,
 
     light: LightReady,
 
@@ -229,6 +234,19 @@ impl Ready {
     #[inline]
     pub fn must_sync(&self) -> bool {
         self.must_sync
+    }
+
+    /// Witness messages to be sent to witnesses (Extended Raft).
+    /// These should be sent after entries are persisted.
+    #[inline]
+    pub fn witness_messages(&self) -> &[WitnessMessage] {
+        &self.witness_messages
+    }
+
+    /// Take the witness messages.
+    #[inline]
+    pub fn take_witness_messages(&mut self) -> Vec<WitnessMessage> {
+        mem::take(&mut self.witness_messages)
     }
 }
 
@@ -553,6 +571,7 @@ impl<T: Storage> RawNode<T> {
         // Leader can send messages immediately to make replication concurrently.
         // For more details, check raft thesis 10.2.1.
         rd.is_persisted_msg = raft.state != StateRole::Leader;
+        rd.witness_messages = mem::take(&mut raft.witness_msgs);
         rd.light = self.gen_light_ready();
         self.records.push_back(rd_record);
         rd
@@ -562,6 +581,10 @@ impl<T: Storage> RawNode<T> {
     pub fn has_ready(&self) -> bool {
         let raft = &self.raft;
         if !raft.msgs.is_empty() {
+            return true;
+        }
+
+        if !raft.witness_msgs.is_empty() {
             return true;
         }
 

@@ -30,6 +30,10 @@ message Entry {
     // Deprecated! It is kept for backward compatibility.
     // TODO: remove it in the next major release.
     bool sync_log = 5;
+
+    // Subterm is used by Extended Raft (witness support). It identifies a
+    // replication epoch within a term. Defaults to 0 for standard Raft.
+    uint64 subterm = 7;
 }
 
 message SnapshotMetadata {
@@ -134,12 +138,20 @@ message ConfState {
     // If set, the config is joint and Raft will automatically transition into
     // the final config (i.e. remove the outgoing config) when this is safe.
     bool auto_leave = 5;
+
+    // Witness is the ID of the witness node in the incoming config.
+    // A witness participates in elections and shortcut replication but
+    // does not run a full Raft instance. 0 means no witness.
+    uint64 witness = 6;
+    // Witness in the outgoing config (for joint consensus).
+    uint64 witness_outgoing = 7;
 }
 
 enum ConfChangeType {
     AddNode    = 0;
     RemoveNode = 1;
     AddLearnerNode = 2;
+    AddWitness = 3;
 }
 
 message ConfChange {
@@ -193,4 +205,41 @@ message ConfChangeV2 {
     ConfChangeTransition transition = 1;
     repeated ConfChangeSingle changes = 2;
     bytes context = 3;
+}
+
+// WitnessHardState is the persistent state stored by a witness node.
+// It extends HardState with replication set information needed for
+// Extended Raft's witness voting logic.
+message WitnessHardState {
+    HardState state = 1;
+    uint64 last_log_index = 2;
+    uint64 last_log_term = 3;
+    uint64 last_log_subterm = 4;
+    uint64 lead = 5;
+    repeated uint64 replication_set = 6;
+    repeated uint64 replication_set_outgoing = 7;
+}
+
+// WitnessMessage is a message sent between a leader/candidate and a witness.
+// It is separate from the regular Message type because witnesses don't
+// participate in the normal Raft message flow — they are accessed via
+// shortcut replication (at most once per subterm).
+message WitnessMessage {
+    MessageType msg_type = 1;
+    uint64 from = 2;
+    uint64 to = 3;
+    uint64 term = 4;
+    uint64 last_log_term = 5;
+    uint64 last_log_subterm = 6;
+    uint64 last_log_index = 7;
+    // replication_set[0] = incoming, replication_set[1] = outgoing
+    repeated uint64 replication_set_incoming = 8;
+    repeated uint64 replication_set_outgoing = 9;
+    // votes is a map of voter_id → voted (for witness vote requests).
+    // Encoded as alternating (id, vote_int) pairs for simplicity in proto3.
+    repeated uint64 vote_ids = 10;
+    repeated bool vote_vals = 11;
+    bytes context = 12;
+    repeated Entry entries = 13;
+    uint64 commit = 14;
 }
