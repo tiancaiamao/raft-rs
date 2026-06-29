@@ -8,6 +8,7 @@
 //   Phase 4: Node 2 fails — leader detects, switches replication set,
 //            continues committing via witness
 //   Phase 5: Node 2 recovers — catches up
+//   Phase 6: Conf change — joint consensus with witness carry-over
 //
 // Run: cargo run --example witness_demo
 
@@ -448,6 +449,76 @@ fn main() {
     if cluster.commit_index(1) == cluster.commit_index(2) {
         println!("  ✓ Node 2 caught up!");
     }
+
+    // ── Phase 6: Conf Change (Joint Consensus with Witness) ──────────
+    println!("\n╔══ Phase 6: Conf Change — Joint Consensus ════════════════════╗");
+    println!("║  Add node 4 as a new voter via joint consensus.             ║");
+    println!("║  The witness must be carried over to the outgoing config    ║");
+    println!("║  so both halves of the joint config have a witness.         ║");
+    println!("╚══════════════════════════════════════════════════════════════╝");
+
+    // Add node 4 to the cluster.
+    cluster.add_node(4, vec![1, 2], &logger);
+
+    // Step 1: Enter joint consensus (Explicit transition prevents auto-leave,
+    // so we can demonstrate the full joint → leave lifecycle).
+    let mut cc_joint = ConfChangeV2::default();
+    cc_joint.set_transition(ConfChangeTransition::Explicit);
+    cc_joint.set_changes(
+        vec![raft_proto::new_conf_change_single(
+            4,
+            ConfChangeType::AddNode,
+        )]
+        .into(),
+    );
+    cluster
+        .node(1)
+        .propose_conf_change(vec![], cc_joint)
+        .unwrap();
+    cluster.step_n(30);
+
+    let w = cluster.node(1).raft.prs().conf().witnesses;
+    let cs = cluster.node(1).raft.prs().conf().to_conf_state();
+    let outgoing: Vec<u64> = cs.get_voters_outgoing().to_vec();
+    println!(
+        "  ✓ Joint state: witnesses={:?}, outgoing={:?}",
+        w, outgoing
+    );
+    println!(
+        "  ✓ Both config halves have the witness (witnesses[1]={})",
+        w[1]
+    );
+    assert_eq!(w, [3, 3], "witness should be in both halves");
+
+    // Step 2: Propose data during joint state — should still commit.
+    cluster
+        .node(1)
+        .propose(vec![], b"during-joint".to_vec())
+        .unwrap();
+    cluster.step_n(20);
+    println!(
+        "  ✓ Committed during joint: commit={}",
+        cluster.commit_index(1)
+    );
+
+    // Step 3: Leave joint consensus.
+    let cc_leave = ConfChangeV2::default(); // empty changes + Auto = leave joint
+    cluster
+        .node(1)
+        .propose_conf_change(vec![], cc_leave)
+        .unwrap();
+    cluster.step_n(30);
+
+    let w2 = cluster.node(1).raft.prs().conf().witnesses;
+    let cs2 = cluster.node(1).raft.prs().conf().to_conf_state();
+    let outgoing2: Vec<u64> = cs2.get_voters_outgoing().to_vec();
+    println!(
+        "  ✓ Left joint: witnesses={:?}, outgoing={:?}",
+        w2, outgoing2
+    );
+    assert_eq!(w2[1], 0, "outgoing witness should be cleared");
+    assert!(outgoing2.is_empty(), "outgoing voters should be cleared");
+    println!("  ✓ Outgoing witness cleared (witnesses[1]=0)");
 
     // ── Summary ───────────────────────────────────────────────────────
     println!("\n═══════════════════════════════════════════════════════════════");

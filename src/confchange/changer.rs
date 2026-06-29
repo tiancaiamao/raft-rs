@@ -84,6 +84,10 @@ impl Changer<'_> {
         cfg.voters
             .outgoing
             .extend(cfg.voters.incoming.iter().cloned());
+        // Extended Raft: carry over the incoming witness to outgoing.
+        // The outgoing config is a snapshot of the pre-change config, so
+        // the witness must be preserved there too.
+        cfg.witnesses[1] = cfg.witnesses[0];
         self.apply(&mut cfg, &mut prs, ccs)?;
         cfg.auto_leave = auto_leave;
         check_invariants(&cfg, &prs)?;
@@ -118,12 +122,20 @@ impl Changer<'_> {
         cfg.learners.extend(cfg.learners_next.drain());
 
         for id in &*cfg.voters.outgoing {
-            if !cfg.voters.incoming.contains(id) && !cfg.learners.contains(id) {
+            // Don't remove a node that is still a voter, learner, or the
+            // incoming witness — the witness needs its progress entry to
+            // remain (Extended Raft).
+            if !cfg.voters.incoming.contains(id)
+                && !cfg.learners.contains(id)
+                && cfg.witnesses[0] != *id
+            {
                 prs.changes.push((*id, MapChangeType::Remove));
             }
         }
 
         cfg.voters.outgoing.clear();
+        // Extended Raft: clear the outgoing witness.
+        cfg.witnesses[1] = 0;
         cfg.auto_leave = false;
         check_invariants(&cfg, &prs)?;
         Ok((cfg, prs.into_changes()))
@@ -252,7 +264,7 @@ impl Changer<'_> {
         }
     }
 
-    /// Removes this peer as a voter or learner from the incoming config.
+    /// Removes this peer as a voter or learner or witness from the incoming config.
     fn remove(&self, cfg: &mut Configuration, prs: &mut IncrChangeMap, id: u64) {
         if !prs.contains(id) {
             return;
@@ -261,6 +273,11 @@ impl Changer<'_> {
         cfg.voters.incoming.remove(&id);
         cfg.learners.remove(&id);
         cfg.learners_next.remove(&id);
+
+        // Extended Raft: clear witness tracking if removing the witness.
+        if cfg.witnesses[0] == id {
+            cfg.witnesses[0] = 0;
+        }
 
         // If the peer is still a voter in the outgoing config, keep the Progress.
         if !cfg.voters.outgoing.contains(&id) {
@@ -361,6 +378,20 @@ fn check_invariants(cfg: &Configuration, prs: &IncrChangeMap) -> Result<()> {
             return Err(Error::ConfChangeError(
                 "auto_leave must be false when not joint".to_owned(),
             ));
+        }
+    }
+
+    // Extended Raft: verify that each configured witness is actually a voter
+    // in its corresponding config half.
+    for (i, voters) in [&cfg.voters.incoming, &cfg.voters.outgoing]
+        .iter()
+        .enumerate()
+    {
+        let w = cfg.witnesses[i];
+        if w > 0 && !voters.contains(&w) {
+            return Err(Error::ConfChangeError(format!(
+                "{w} is in Witnesses[{i}] but not in Voters[{i}]"
+            )));
         }
     }
 

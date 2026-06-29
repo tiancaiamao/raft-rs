@@ -64,7 +64,8 @@ pub struct Witness {
     /// Current leader ID.
     pub lead: u64,
 
-    /// Replication set (incoming voters that the leader replicates to).
+    /// Replication set (non-witness voters that the leader replicates to).
+    /// Includes both incoming and outgoing voters during joint consensus.
     pub replication_set: HashSet<u64>,
 }
 
@@ -149,8 +150,13 @@ impl Witness {
         }
         self.lead = msg.from;
 
-        // Update replication set.
-        self.replication_set = msg.replication_set_incoming.iter().copied().collect();
+        // Update replication set. During joint consensus, the witness needs to
+        // know voters from both halves so it can validate votes correctly.
+        self.replication_set.clear();
+        self.replication_set
+            .extend(msg.replication_set_incoming.iter().copied());
+        self.replication_set
+            .extend(msg.replication_set_outgoing.iter().copied());
 
         // Process entries.
         let entries = msg.get_entries();

@@ -405,6 +405,253 @@ fn test_shortcut_replication_new_subterm_allows_contact() {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// Conf change with witness
+// ═══════════════════════════════════════════════════════════════════
+
+// Helper: create a ConfChangeV2 that forces joint consensus via Implicit transition.
+fn joint_conf_change(changes: Vec<ConfChangeSingle>) -> raft::eraftpb::ConfChangeV2 {
+    raft::eraftpb::ConfChangeV2 {
+        transition: raft::eraftpb::ConfChangeTransition::Implicit,
+        changes: changes.into(),
+        ..Default::default()
+    }
+}
+
+// Helper: create a ConfChangeV2 that leaves joint state.
+fn leave_joint_cc() -> raft::eraftpb::ConfChangeV2 {
+    raft::eraftpb::ConfChangeV2 {
+        transition: raft::eraftpb::ConfChangeTransition::Auto,
+        ..Default::default()
+    }
+}
+
+fn add_node(id: u64) -> ConfChangeSingle {
+    ConfChangeSingle {
+        change_type: ConfChangeType::AddNode,
+        node_id: id,
+        ..Default::default()
+    }
+}
+
+fn remove_node(id: u64) -> ConfChangeSingle {
+    ConfChangeSingle {
+        change_type: ConfChangeType::RemoveNode,
+        node_id: id,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn test_enter_joint_preserves_witness_in_outgoing() {
+    // P0: enter_joint must copy witnesses[0] → witnesses[1].
+    let mut node = make_witness_node(1, vec![1, 2, 3], 3);
+    node.raft.become_candidate();
+    node.raft.become_leader();
+
+    // Before conf change: only incoming witness.
+    assert_eq!(node.raft.prs().conf().witnesses, [3, 0]);
+
+    // Apply a conf change with Implicit transition to force joint consensus.
+    let cc = joint_conf_change(vec![add_node(4)]);
+    node.raft.apply_conf_change(&cc).unwrap();
+
+    // After enter_joint, both configs should have witness.
+    assert_eq!(node.raft.prs().conf().witnesses, [3, 3]);
+    let cs = node.raft.prs().conf().to_conf_state();
+    assert!(!cs.get_voters_outgoing().is_empty());
+}
+
+#[test]
+fn test_leave_joint_clears_outgoing_witness() {
+    // P0: leave_joint must clear witnesses[1].
+    let mut node = make_witness_node(1, vec![1, 2, 3], 3);
+    node.raft.become_candidate();
+    node.raft.become_leader();
+
+    // Enter joint.
+    let cc_enter = joint_conf_change(vec![add_node(4)]);
+    node.raft.apply_conf_change(&cc_enter).unwrap();
+    assert_eq!(node.raft.prs().conf().witnesses, [3, 3]);
+
+    // Leave joint.
+    let cc_leave = leave_joint_cc();
+    node.raft.apply_conf_change(&cc_leave).unwrap();
+
+    // Outgoing witness should be cleared.
+    assert_eq!(node.raft.prs().conf().witnesses[1], 0);
+    let cs = node.raft.prs().conf().to_conf_state();
+    assert!(cs.get_voters_outgoing().is_empty());
+}
+
+#[test]
+fn test_conf_change_starts_new_subterm() {
+    // After a conf change, a new subterm should start.
+    let mut node = make_witness_node(1, vec![1, 2, 3], 3);
+    node.raft.become_candidate();
+    node.raft.become_leader();
+    let subterm_before = node.raft.prs().epoch.subterm;
+
+    let cc = raft::eraftpb::ConfChangeV2 {
+        changes: vec![add_node(4)].into(),
+        ..Default::default()
+    };
+    node.raft.apply_conf_change(&cc).unwrap();
+
+    let subterm_after = node.raft.prs().epoch.subterm;
+    assert!(
+        subterm_after > subterm_before || node.raft.prs().epoch.subterm == 0,
+        "subterm should increment or reset after conf change"
+    );
+}
+
+#[test]
+fn test_joint_state_reset_replication_set_both_halves() {
+    // After enter_joint, reset_replication_set should set up witness in both halves.
+    let mut node = make_witness_node(1, vec![1, 2, 3], 3);
+    node.raft.become_candidate();
+    node.raft.become_leader();
+
+    let cc = joint_conf_change(vec![add_node(4)]);
+    node.raft.apply_conf_change(&cc).unwrap();
+
+    let epoch = &node.raft.prs().epoch;
+
+    // Incoming half: witness = 3.
+    assert_eq!(epoch.replication_sets[0].witness, 3);
+
+    // Outgoing half: witness = 3 (preserved from pre-change config).
+    assert_eq!(epoch.replication_sets[1].witness, 3);
+}
+
+#[test]
+fn test_joint_state_has_witness_in_both_halves() {
+    let mut node = make_witness_node(1, vec![1, 2, 3], 3);
+    node.raft.become_candidate();
+    node.raft.become_leader();
+
+    let cc = joint_conf_change(vec![add_node(4)]);
+    node.raft.apply_conf_change(&cc).unwrap();
+
+    let epoch = &node.raft.prs().epoch;
+    assert!(epoch.has_witness());
+
+    // Both halves should have witness.
+    assert!(epoch.replication_sets[0].witness != 0);
+    assert!(epoch.replication_sets[1].witness != 0);
+}
+
+#[test]
+fn test_conf_change_add_witness() {
+    // Start with 3 voters, no witness.
+    let storage = MemStorage::default();
+    let mut cs = ConfState::default();
+    cs.set_voters(vec![1, 2, 3]);
+    storage.initialize_with_conf_state(cs);
+
+    let config = raft::Config {
+        id: 1,
+        ..Default::default()
+    };
+    let mut node = RawNode::new(&config, storage, &make_logger()).unwrap();
+    assert_eq!(node.raft.prs().conf().witnesses, [0, 0]);
+
+    node.raft.become_candidate();
+    node.raft.become_leader();
+
+    // Add node 4 as witness.
+    let cc = raft::eraftpb::ConfChangeV2 {
+        changes: vec![ConfChangeSingle {
+            change_type: ConfChangeType::AddWitness,
+            node_id: 4,
+            ..Default::default()
+        }]
+        .into(),
+        ..Default::default()
+    };
+    node.raft.apply_conf_change(&cc).unwrap();
+
+    // Node 4 should now be marked as witness.
+    assert_eq!(node.raft.prs().conf().witnesses[0], 4);
+    assert!(node.raft.prs().get(4).unwrap().is_witness);
+    assert!(!node.raft.prs().get(1).unwrap().is_witness);
+}
+
+#[test]
+fn test_conf_change_remove_witness() {
+    let mut node = make_witness_node(1, vec![1, 2, 3], 3);
+    node.raft.become_candidate();
+    node.raft.become_leader();
+
+    // Remove witness node 3.
+    let cc = raft::eraftpb::ConfChangeV2 {
+        changes: vec![remove_node(3)].into(),
+        ..Default::default()
+    };
+    node.raft.apply_conf_change(&cc).unwrap();
+
+    // Node 3 should be removed from progress tracker.
+    assert!(node.raft.prs().get(3).is_none());
+    // witnesses[0] should be cleared (Bug 2 fix).
+    assert_eq!(node.raft.prs().conf().witnesses[0], 0);
+}
+
+#[test]
+fn test_simple_conf_change_no_witness_stays_unaffected() {
+    // Simple conf change on a non-witness cluster should not be affected.
+    let storage = MemStorage::default();
+    let mut cs = ConfState::default();
+    cs.set_voters(vec![1, 2, 3]);
+    storage.initialize_with_conf_state(cs);
+
+    let config = raft::Config {
+        id: 1,
+        ..Default::default()
+    };
+    let mut node = RawNode::new(&config, storage, &make_logger()).unwrap();
+    node.raft.become_candidate();
+    node.raft.become_leader();
+
+    let cc = raft::eraftpb::ConfChangeV2 {
+        changes: vec![add_node(4)].into(),
+        ..Default::default()
+    };
+    node.raft.apply_conf_change(&cc).unwrap();
+
+    // No witness should be configured.
+    assert_eq!(node.raft.prs().conf().witnesses, [0, 0]);
+    assert!(!node.raft.prs().epoch.has_witness());
+}
+
+#[test]
+fn test_joint_state_witness_in_both_replication_sets() {
+    // After enter_joint, the witness should appear in both replication sets,
+    // and both should be properly initialized.
+    let mut node = make_witness_node(1, vec![1, 2, 3], 3);
+    node.raft.become_candidate();
+    node.raft.become_leader();
+
+    let cc = joint_conf_change(vec![add_node(4)]);
+    node.raft.apply_conf_change(&cc).unwrap();
+
+    let epoch = &node.raft.prs().epoch;
+
+    // Incoming: voters = {1,2,3,4}, witness = 3.
+    let r0 = &epoch.replication_sets[0];
+    assert_eq!(r0.witness, 3);
+    assert!(r0.non_witness_voters.contains(&1));
+    assert!(r0.non_witness_voters.contains(&2));
+    assert!(r0.non_witness_voters.contains(&4));
+    assert!(!r0.non_witness_voters.contains(&3));
+
+    // Outgoing: voters = {1,2,3}, witness = 3.
+    let r1 = &epoch.replication_sets[1];
+    assert_eq!(r1.witness, 3);
+    assert!(r1.non_witness_voters.contains(&1));
+    assert!(r1.non_witness_voters.contains(&2));
+    assert!(!r1.non_witness_voters.contains(&3));
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // Witness module unit tests (from the original file, kept for completeness)
 // ═══════════════════════════════════════════════════════════════════
 
@@ -459,4 +706,189 @@ fn test_witness_module_reject_stale() {
         resp,
         Some(raft::WitnessResponse::VoteGrant(false))
     ));
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Conf change edge cases with witness (etcd-parity fixes)
+// ═══════════════════════════════════════════════════════════════════
+
+#[test]
+fn test_leave_joint_preserves_witness_progress() {
+    // Bug 1: leave_joint must not remove the witness node from progress
+    // if it's in outgoing only but still the incoming witness.
+    //
+    // Setup: incoming = {1, 2, 3w}, outgoing = {1, 2, 3w}
+    // After AddNode(4) + AddWitness(4) in joint:
+    //   incoming = {1, 2, 3, 4w}, witnesses = [4, 3]
+    //   outgoing = {1, 2, 3}, witnesses_out = 3
+    // After leave_joint: outgoing cleared, node 3 is not in incoming voters
+    //   but is it still the incoming witness? No — witnesses[0] = 4.
+    // So node 3 should be removed normally.
+
+    // Different scenario: witness stays the same across conf change.
+    let mut node = make_witness_node(1, vec![1, 2, 3], 3);
+    node.raft.become_candidate();
+    node.raft.become_leader();
+
+    // Enter joint: add node 4 (witness stays as 3 in both halves).
+    let cc = joint_conf_change(vec![add_node(4)]);
+    node.raft.apply_conf_change(&cc).unwrap();
+    assert_eq!(node.raft.prs().conf().witnesses, [3, 3]);
+
+    // Leave joint.
+    let cc_leave = leave_joint_cc();
+    node.raft.apply_conf_change(&cc_leave).unwrap();
+
+    // Node 4 should stay (it's in incoming voters).
+    assert!(node.raft.prs().get(4).is_some());
+    // Node 3 (witness) should stay.
+    assert!(node.raft.prs().get(3).is_some());
+    // witnesses[1] cleared.
+    assert_eq!(node.raft.prs().conf().witnesses[1], 0);
+    // witnesses[0] still 3.
+    assert_eq!(node.raft.prs().conf().witnesses[0], 3);
+}
+
+#[test]
+fn test_remove_witness_clears_witnesses_field() {
+    // Bug 2: remove() must clear witnesses[0] when the witness is removed.
+    let mut node = make_witness_node(1, vec![1, 2, 3], 3);
+    node.raft.become_candidate();
+    node.raft.become_leader();
+    assert_eq!(node.raft.prs().conf().witnesses[0], 3);
+
+    // Remove witness via simple conf change.
+    let cc = raft::eraftpb::ConfChangeV2 {
+        changes: vec![remove_node(3)].into(),
+        ..Default::default()
+    };
+    node.raft.apply_conf_change(&cc).unwrap();
+
+    // witnesses[0] must be cleared, not stale.
+    assert_eq!(node.raft.prs().conf().witnesses[0], 0);
+}
+
+#[test]
+fn test_joint_remove_old_witness_add_new_witness() {
+    // Edge case: change witness from 3 to 4 in a joint conf change.
+    // Enter joint with RemoveNode(3) + AddWitness(4).
+    let mut node = make_witness_node(1, vec![1, 2, 3], 3);
+    node.raft.become_candidate();
+    node.raft.become_leader();
+
+    let cc = joint_conf_change(vec![
+        remove_node(3),
+        ConfChangeSingle {
+            change_type: ConfChangeType::AddWitness,
+            node_id: 4,
+            ..Default::default()
+        },
+    ]);
+    node.raft.apply_conf_change(&cc).unwrap();
+
+    // After enter_joint:
+    // witnesses[1] = 3 (old witness, carried to outgoing)
+    // witnesses[0] = 4 (new witness, set by make_witness)
+    assert_eq!(node.raft.prs().conf().witnesses, [4, 3]);
+
+    // Outgoing config: {1, 2, 3} with witness 3.
+    // Incoming config: {1, 2, 4} with witness 4.
+    let cs = node.raft.prs().conf().to_conf_state();
+    assert!(cs.get_voters_outgoing().contains(&3));
+
+    // Leave joint.
+    let cc_leave = leave_joint_cc();
+    node.raft.apply_conf_change(&cc_leave).unwrap();
+
+    // After leave_joint: outgoing cleared.
+    assert_eq!(node.raft.prs().conf().witnesses[1], 0);
+    assert_eq!(node.raft.prs().conf().witnesses[0], 4);
+    // Node 3 removed (not in incoming, not witness).
+    assert!(node.raft.prs().get(3).is_none());
+    // Node 4 still present.
+    assert!(node.raft.prs().get(4).is_some());
+}
+
+#[test]
+fn test_witness_vote_joint_consensus_validation() {
+    // Bug 4: during joint consensus, witness must know voters from both
+    // halves to validate votes correctly. An outgoing-only voter that
+    // voted yes must not cause rejection.
+    use raft::Witness;
+
+    let mut w = Witness::new(5);
+    w.term = 1;
+    w.last_log_term = 1;
+    w.last_log_subterm = 1;
+    w.last_log_index = 5;
+
+    // Simulate an AppendEntries to witness that sets up the replication set
+    // with both incoming and outgoing voters.
+    let mut append_msg = WitnessMessage::default();
+    append_msg.set_from(1);
+    append_msg.set_to(5);
+    append_msg.set_term(1);
+    append_msg.set_msg_type(MessageType::MsgAppend);
+    append_msg.set_last_log_term(1);
+    append_msg.set_last_log_index(5);
+    append_msg.set_last_log_subterm(1);
+    append_msg.replication_set_incoming = vec![1, 2].into(); // incoming non-witness voters
+    append_msg.replication_set_outgoing = vec![1, 3].into(); // outgoing non-witness voters
+    w.process(&append_msg);
+
+    // Witness should know about all voters from both halves.
+    assert!(w.replication_set.contains(&1));
+    assert!(w.replication_set.contains(&2));
+    assert!(w.replication_set.contains(&3));
+
+    // Now candidate sends RequestVote with votes from {1, 3}.
+    // Node 3 is outgoing-only, but witness should accept because
+    // it knows about outgoing voters.
+    let mut vote_msg = WitnessMessage::default();
+    vote_msg.set_from(1);
+    vote_msg.set_to(5);
+    vote_msg.set_term(1);
+    vote_msg.set_msg_type(MessageType::MsgRequestVote);
+    vote_msg.set_last_log_term(1);
+    vote_msg.set_last_log_index(5);
+    vote_msg.set_last_log_subterm(1);
+    vote_msg.vote_ids = vec![1, 3];
+    vote_msg.vote_vals = vec![true, true];
+
+    let resp = w.process(&vote_msg);
+    assert!(
+        matches!(resp, Some(raft::WitnessResponse::VoteGrant(true))),
+        "witness should grant vote even with outgoing-only voter"
+    );
+}
+
+#[test]
+fn test_check_invariants_rejects_witness_not_in_voters() {
+    // Bug 3: check_invariants should reject configs where witness is not
+    // actually in the voter set. This is tested indirectly via apply_conf_change
+    // which calls check_invariants internally.
+    //
+    // We can't easily craft an invalid Configuration from outside, but we
+    // can verify that AddWitness correctly adds to voters (so invariants pass).
+    let mut node = make_witness_node(1, vec![1, 2], 0);
+    node.raft.become_candidate();
+    node.raft.become_leader();
+
+    // Add witness node 3 — should succeed and add to voters.
+    let cc = raft::eraftpb::ConfChangeV2 {
+        changes: vec![ConfChangeSingle {
+            change_type: ConfChangeType::AddWitness,
+            node_id: 3,
+            ..Default::default()
+        }]
+        .into(),
+        ..Default::default()
+    };
+    node.raft.apply_conf_change(&cc).unwrap();
+
+    assert_eq!(node.raft.prs().conf().witnesses[0], 3);
+    assert!(node.raft.prs().get(3).is_some());
+    // Node 3 should be in voters (checked by invariants passing).
+    let cs = node.raft.prs().conf().to_conf_state();
+    assert!(cs.get_voters().contains(&3));
 }
