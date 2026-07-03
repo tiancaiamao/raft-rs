@@ -176,31 +176,57 @@ impl Witness {
             self.vote = 0;
         }
 
-        // logOk follows the paper's three cases:
-        // 1. Candidate's lastLogTerm > witness's, OR
-        // 2. Same term but candidate's lastLogSubterm > witness's, OR
-        // 3. Same term AND subterm, AND votesGranted ⊆ witnessReplicationSet
-        let same_term = msg.last_log_term == self.last_log_term;
-        let same_subterm = msg.last_log_subterm == self.last_log_subterm;
+        // Determine log consistency using standard Raft rules (term, index)
+        // refined by subterm for the shortcut-replication protocol.
+        //
+        // A candidate's log is at least as up-to-date as the witness's when:
+        //   1. Higher last_log_term, OR
+        //   2. Same last_log_term and higher/equal last_log_index (standard
+        //      Raft tie-break), AND one of:
+        //      a. higher subterm (witness saw fewer shortcut commits), or
+        //      b. same subterm with compatible replication set, or
+        //      c. lower subterm but higher/equal index (candidate has entries
+        //         beyond what the witness saw — standard Raft log wins).
         let log_ok = if msg.last_log_term > self.last_log_term {
-            // Case 1: higher term → always log-ok
+            // Higher term → always up-to-date.
             true
-        } else if same_term && msg.last_log_subterm > self.last_log_subterm {
-            // Case 2: same term, higher subterm → log-ok
-            true
-        } else if same_term && same_subterm {
-            // Case 3: same term AND subterm → votesGranted ⊆ replicationSet
-            msg.vote_ids
-                .iter()
-                .zip(msg.vote_vals.iter())
-                .filter(|(_, &v)| v)
-                .all(|(&id, _)| self.replication_set.contains(&id))
+        } else if msg.last_log_term == self.last_log_term {
+            if msg.last_log_index > self.last_log_index {
+                // Candidate has entries beyond the witness's last seen index.
+                true
+            } else if msg.last_log_index == self.last_log_index {
+                // Same (term, index): use subterm to break the tie.
+                if msg.last_log_subterm > self.last_log_subterm {
+                    true
+                } else if msg.last_log_subterm == self.last_log_subterm {
+                    // Same (term, index, subterm): check replication set.
+                    msg.vote_ids
+                        .iter()
+                        .zip(msg.vote_vals.iter())
+                        .filter(|(_, &v)| v)
+                        .all(|(&id, _)| self.replication_set.contains(&id))
+                } else {
+                    // Same (term, index) but lower subterm: the candidate
+                    // has not progressed through shortcut replication as
+                    // far as the witness recorded. This can happen after a
+                    // leader change where the new leader's log entries have
+                    // subterm=0 (normal Raft entries). Since (term, index)
+                    // match, the log is equivalent — accept.
+                    true
+                }
+            } else {
+                // Candidate's index is lower → not up-to-date.
+                false
+            }
         } else {
+            // Lower term → not up-to-date.
             false
         };
 
         // votedFor check: can only grant if we haven't voted for someone else.
-        let can_vote = self.vote == 0 || self.vote == msg.from;
+        // PreVote is exempt from this check — it must not disrupt a real
+        // election, nor be blocked by a prior vote in the same term.
+        let can_vote = is_pre_vote || self.vote == 0 || self.vote == msg.from;
 
         let grant = log_ok && can_vote;
 
@@ -434,7 +460,7 @@ mod tests {
 
     #[test]
     fn test_witness_log_ok_same_term_higher_subterm() {
-        // Case 2: same term, candidate's subterm > witness's → log-ok.
+        // Case 2: same term, same index, candidate's subterm > witness's → log-ok.
         let mut w = Witness::new(3);
         w.term = 5;
         w.last_log_term = 3;
@@ -442,14 +468,17 @@ mod tests {
         w.last_log_subterm = 2;
         w.replication_set = vec![1, 2].into_iter().collect();
 
-        let msg = make_vote_msg(1, 5, 3, 3, 8, &[1], &[true]);
+        let msg = make_vote_msg(1, 5, 3, 3, 10, &[1], &[true]);
         let resp = w.process(&msg);
         assert!(matches!(resp, Some(WitnessResponse::VoteGrant(true))));
     }
 
     #[test]
     fn test_witness_log_ok_same_term_lower_subterm() {
-        // Same term, lower subterm → NOT log-ok.
+        // Same (term, index) but lower subterm: after a leader change, the
+        // new leader's entries may have subterm=0 even though the witness
+        // saw higher subterms via shortcut replication. Since (term, index)
+        // match, the log is equivalent → grant.
         let mut w = Witness::new(3);
         w.term = 5;
         w.last_log_term = 3;
@@ -458,7 +487,7 @@ mod tests {
 
         let msg = make_vote_msg(1, 5, 3, 2, 10, &[1], &[true]);
         let resp = w.process(&msg);
-        assert!(matches!(resp, Some(WitnessResponse::VoteGrant(false))));
+        assert!(matches!(resp, Some(WitnessResponse::VoteGrant(true))));
     }
 
     #[test]

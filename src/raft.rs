@@ -979,11 +979,15 @@ impl<T: Storage> Raft<T> {
 
         // Send entries starting from the witness's match index + 1,
         // not from the q-1 index (which may skip entries the witness hasn't seen).
+        // Clamp to the log's first index: the witness is a logical entity and
+        // does not need entries that have already been compacted.
+        let log_first = self.raft_log.first_index();
         let next_idx = self
             .prs()
             .get(witness_id)
             .map(|pr| pr.matched + 1)
-            .unwrap_or(1);
+            .unwrap_or(1)
+            .max(log_first);
         let entries = self.raft_log.entries(
             next_idx,
             NO_LIMIT,
