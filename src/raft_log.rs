@@ -658,12 +658,13 @@ impl<T: Storage> RaftLog<T> {
                 Err(e) => match e {
                     Error::Store(StorageError::Compacted)
                     | Error::Store(StorageError::LogTemporarilyUnavailable) => return Err(e),
-                    Error::Store(StorageError::Unavailable) => fatal!(
-                        self.unstable.logger,
-                        "entries[{}:{}] is unavailable from storage",
-                        low,
-                        unstable_high,
-                    ),
+                    Error::Store(StorageError::Unavailable) => {
+                        warn!(
+                            self.unstable.logger,
+                            "entries[{}:{}] is unavailable from storage", low, unstable_high,
+                        );
+                        return Err(Error::Store(StorageError::Unavailable));
+                    }
                     _ => fatal!(self.unstable.logger, "unexpected error: {:?}", e),
                 },
                 Ok(entries) => {

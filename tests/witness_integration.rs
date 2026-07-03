@@ -306,7 +306,20 @@ fn test_shortcut_replication_sends_once_per_subterm() {
 
     node.raft.maybe_commit();
 
-    // After first contact, witness_subterm should be set.
+    // After first contact, witness_pending_subterm should be set but
+    // witness_subterm should NOT yet be set — it waits for CAS confirmation.
+    assert_eq!(
+        node.raft.prs().epoch.witness_pending_subterm[0],
+        node.raft.prs().epoch.subterm
+    );
+    assert_eq!(
+        node.raft.prs().epoch.witness_subterm[0],
+        node.raft.prs().epoch.subterm - 1 // still old value
+    );
+
+    // Simulate CAS success.
+    node.raft.confirm_witness_append(3);
+    assert_eq!(node.raft.prs().epoch.witness_pending_subterm[0], 0);
     assert_eq!(
         node.raft.prs().epoch.witness_subterm[0],
         node.raft.prs().epoch.subterm
@@ -335,6 +348,8 @@ fn test_shortcut_replication_synthesizes_second_ack() {
     // First: trigger initial witness contact.
     node.raft.mut_prs().get_mut(1).unwrap().matched = node.raft.raft_log.last_index();
     node.raft.maybe_commit();
+    // Simulate CAS success to activate shortcut replication.
+    node.raft.confirm_witness_append(3);
     node.raft.witness_msgs.clear();
 
     let witness_matched_after_first = node.raft.prs().get(3).unwrap().matched;
@@ -369,18 +384,89 @@ fn test_shortcut_replication_synthesizes_second_ack() {
 }
 
 #[test]
+fn test_shortcut_replication_blocked_until_cas_confirmed() {
+    let mut node = setup_leader_with_active_witness();
+
+    // Trigger first witness contact.
+    node.raft.mut_prs().get_mut(1).unwrap().matched = node.raft.raft_log.last_index();
+    node.raft.maybe_commit();
+    assert_eq!(
+        node.raft.prs().epoch.witness_pending_subterm[0],
+        node.raft.prs().epoch.subterm
+    );
+    node.raft.witness_msgs.clear();
+
+    // Do NOT call confirm_witness_append — simulate CAS failure / pending.
+    // A second maybe_commit must NOT activate shortcut replication.
+    let witness_matched_before = node.raft.prs().get(3).unwrap().matched;
+
+    // Append a new entry and ack from voter 1.
+    let mut entry = Entry::default();
+    entry.term = node.raft.term;
+    entry.subterm = node.raft.prs().epoch.subterm;
+    let _ = node.raft.append_entry(&mut [entry]);
+    node.raft.raft_log.persisted = node.raft.raft_log.last_index();
+    node.raft.mut_prs().get_mut(1).unwrap().matched = node.raft.raft_log.last_index();
+
+    node.raft.maybe_commit();
+
+    // witness_subterm should NOT be set, so no synthesized ack.
+    assert_ne!(
+        node.raft.prs().epoch.witness_subterm[0],
+        node.raft.prs().epoch.subterm,
+        "witness_subterm must not advance without CAS confirmation"
+    );
+    let witness_matched_after = node.raft.prs().get(3).unwrap().matched;
+    assert_eq!(
+        witness_matched_before, witness_matched_after,
+        "witness matched must not advance without CAS confirmation"
+    );
+
+    // Also should NOT re-send append (pending flag prevents it).
+    let append_msgs: Vec<_> = node
+        .raft
+        .witness_msgs
+        .iter()
+        .filter(|m| m.get_msg_type() == MessageType::MsgAppend)
+        .collect();
+    assert!(
+        append_msgs.is_empty(),
+        "should NOT re-send append while pending"
+    );
+
+    // Now simulate CAS success.
+    node.raft.confirm_witness_append(3);
+    assert_eq!(node.raft.prs().epoch.witness_pending_subterm[0], 0);
+    assert_eq!(
+        node.raft.prs().epoch.witness_subterm[0],
+        node.raft.prs().epoch.subterm
+    );
+
+    // Next maybe_commit should now synthesize the witness ack and commit.
+    node.raft.maybe_commit();
+    let witness_matched_final = node.raft.prs().get(3).unwrap().matched;
+    assert!(
+        witness_matched_final > witness_matched_after,
+        "witness matched should advance after CAS confirmation + shortcut"
+    );
+}
+
+#[test]
 fn test_shortcut_replication_new_subterm_allows_contact() {
     let mut node = setup_leader_with_active_witness();
 
     // First contact.
     node.raft.mut_prs().get_mut(1).unwrap().matched = node.raft.raft_log.last_index();
     node.raft.maybe_commit();
+    // Simulate CAS success.
+    node.raft.confirm_witness_append(3);
     node.raft.witness_msgs.clear();
 
     // Force a new subterm via conf_change=true.
     node.raft.maybe_start_new_subterm(false, true);
-    // reset_replication_set creates a new Epoch → witness_subterm resets.
+    // reset_replication_set creates a new Epoch → witness_subterm and witness_pending_subterm reset.
     assert_eq!(node.raft.prs().epoch.witness_subterm, [0, 0]);
+    assert_eq!(node.raft.prs().epoch.witness_pending_subterm, [0, 0]);
 
     // Re-activate witness (node 2 inactive again).
     node.raft.mut_prs().get_mut(1).unwrap().recent_active = true;

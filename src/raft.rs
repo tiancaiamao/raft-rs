@@ -933,43 +933,48 @@ impl<T: Storage> Raft<T> {
         let self_id = self.id;
         let core = &mut self.r;
         let msgs = &mut self.msgs;
-        let witness_msgs = &mut self.witness_msgs;
         self.prs
             .iter_mut()
             .filter(|&(id, _)| *id != self_id)
+            .filter(|(_, pr)| !pr.is_witness)
             .for_each(|(id, pr)| {
-                if pr.is_witness {
-                    // Send witness heartbeat.
-                    let mut msg = WitnessMessage::default();
-                    msg.to = *id;
-                    msg.from = self_id;
-                    msg.msg_type = MessageType::MsgHeartbeat;
-                    msg.term = core.term;
-                    if let Some(ref context) = ctx {
-                        msg.context = context.clone().into();
-                    }
-                    witness_msgs.push(msg);
-                } else {
-                    core.send_heartbeat(*id, pr, ctx.clone(), msgs);
-                }
+                core.send_heartbeat(*id, pr, ctx.clone(), msgs);
             });
+
+        // Extended Raft: auto-ack witness for ReadIndex (ReadOnlyOption::Safe).
+        // The witness is a logical entity (etcd-backed), so we treat it as
+        // acknowledged immediately without sending a heartbeat. Combined with
+        // the leader's own ack (inserted in add_request), this gives quorum
+        // for read-only requests in degraded mode (e.g. 2F1A with one node down).
+        if let Some(ref ctx) = ctx {
+            let witnesses = self.prs.conf().witnesses;
+            for &wid in witnesses.iter().filter(|&&w| w != 0) {
+                let reached = match self.r.read_only.recv_ack(wid, ctx) {
+                    Some(acks) => self.prs.has_quorum(acks),
+                    None => false,
+                };
+                if reached {
+                    for rs in self.r.read_only.advance(ctx, &self.r.logger) {
+                        if let Some(m) = self.handle_ready_read_index(rs.req, rs.index) {
+                            self.r.send(m, &mut self.msgs);
+                        }
+                    }
+                    break;
+                }
+            }
+        }
     }
 
     /// Sends entries to a witness via shortcut replication (Extended Raft).
     /// Returns which config half (0=incoming, 1=outgoing) a witness belongs to.
     fn witness_config_half(&self, witness_id: u64) -> Option<usize> {
         let epoch = &self.prs().epoch;
-        for i in 0..2 {
-            if epoch.replication_sets[i].witness == witness_id {
-                return Some(i);
-            }
-        }
-        None
+        (0..2).find(|&i| epoch.replication_sets[i].witness == witness_id)
     }
 
     /// Called when q-1 voters in the replication set have acknowledged entries
     /// up to `index`. The witness receives entries at most once per subterm.
-    fn send_append_to_witness(&mut self, witness_id: u64, _index: u64) {
+    fn send_append_to_witness(&mut self, witness_id: u64, _index: u64) -> bool {
         let epoch = &self.prs.epoch;
 
         // Send entries starting from the witness's match index + 1,
@@ -990,11 +995,11 @@ impl<T: Storage> Raft<T> {
         );
         let entries = match entries {
             Ok(e) => e,
-            Err(Error::Store(StorageError::LogTemporarilyUnavailable)) => return,
-            Err(_) => return,
+            Err(Error::Store(StorageError::LogTemporarilyUnavailable)) => return false,
+            Err(_) => return false,
         };
         if entries.is_empty() {
-            return;
+            return false;
         }
 
         let first = &entries[0];
@@ -1022,6 +1027,7 @@ impl<T: Storage> Raft<T> {
         msg.entries = entries.into();
 
         self.witness_msgs.push(msg);
+        true
     }
 
     /// Sends a RequestVote to a witness (Extended Raft).
@@ -1129,11 +1135,19 @@ impl<T: Storage> Raft<T> {
                                 pr.state = ProgressState::Replicate;
                             }
                         }
-                    } else {
+                    } else if self.prs().epoch.witness_pending_subterm[half] == 0 {
                         // First contact this subterm: send actual entries.
-                        self.send_append_to_witness(*witness_id, *idx);
-                        self.mut_prs().epoch.witness_subterm[half] = current_subterm;
+                        // witness_subterm is NOT set here — it is set only
+                        // after the external storage layer confirms the CAS
+                        // write succeeded (see confirm_witness_append). This
+                        // ensures shortcut replication never activates on a
+                        // stale leader whose witness state was overwritten.
+                        let sent = self.send_append_to_witness(*witness_id, *idx);
+                        if sent {
+                            self.mut_prs().epoch.witness_pending_subterm[half] = current_subterm;
+                        }
                     }
+                    // else: append already sent, awaiting CAS confirmation.
                 }
             }
         }
@@ -1148,6 +1162,46 @@ impl<T: Storage> Raft<T> {
             return true;
         }
         false
+    }
+
+    /// Confirms that a witness append has been successfully persisted to external
+    /// storage (CAS succeeded). Activates shortcut replication for this witness in
+    /// the current subterm so that subsequent commits synthesize the witness ack
+    /// without further storage I/O.
+    ///
+    /// Must be called by the host application (CSE) after a successful `cas_save`
+    /// for a `WitnessMessage(MsgAppend)`.
+    pub fn confirm_witness_append(&mut self, witness_id: u64) {
+        if let Some(half) = self.witness_config_half(witness_id) {
+            let current_subterm = self.prs().epoch.subterm;
+            // Guard against stale confirmations: the pending subterm must
+            // match the current subterm. If a new subterm has started
+            // (reset_replication_set clears pending_subterm to 0), the
+            // in-flight CAS belongs to the old subterm and must not activate
+            // shortcut replication for the current one.
+            if self.prs().epoch.witness_pending_subterm[half] != current_subterm {
+                return;
+            }
+            self.mut_prs().epoch.witness_subterm[half] = current_subterm;
+            self.mut_prs().epoch.witness_pending_subterm[half] = 0;
+        }
+    }
+
+    /// Notifies that a witness append failed (CAS mismatch or storage error).
+    /// Resets the pending flag so the next `maybe_commit` can retry.
+    ///
+    /// On CAS mismatch the retry will likely fail again (another leader holds
+    /// a newer subterm), but this is harmless — the leader will be deposed by
+    /// election timeout. On transient errors the retry provides recovery.
+    pub fn reject_witness_append(&mut self, witness_id: u64) {
+        if let Some(half) = self.witness_config_half(witness_id) {
+            let current_subterm = self.prs().epoch.subterm;
+            // Guard against stale rejections, same rationale as confirm.
+            if self.prs().epoch.witness_pending_subterm[half] != current_subterm {
+                return;
+            }
+            self.mut_prs().epoch.witness_pending_subterm[half] = 0;
+        }
     }
 
     /// Commit that the Raft peer has applied up to the given index.
@@ -2287,6 +2341,15 @@ impl<T: Storage> Raft<T> {
         match m.get_msg_type() {
             MessageType::MsgBeat => {
                 self.bcast_heartbeat();
+                // Extended Raft: re-check commit after heartbeat broadcast.
+                // This is needed for shortcut replication: when the witness
+                // has been contacted (send_append_to_witness) in a previous
+                // maybe_commit call, the synthesized witness ack needs a
+                // subsequent maybe_commit to take effect. Without this,
+                // the leader can't commit in degraded mode (2F1A).
+                if self.has_witness() && self.maybe_commit() && self.should_bcast_commit() {
+                    self.bcast_append();
+                }
                 return Ok(());
             }
             MessageType::MsgCheckQuorum => {
@@ -2445,7 +2508,7 @@ impl<T: Storage> Raft<T> {
             }
             MessageType::MsgTransferLeader => {
                 // Witnesses can't be leaders.
-                if self.prs().get(m.from).map_or(false, |pr| pr.is_witness) {
+                if self.prs().get(m.from).is_some_and(|pr| pr.is_witness) {
                     debug!(
                         self.logger,
                         "{} is witness. Ignored transferring leadership",

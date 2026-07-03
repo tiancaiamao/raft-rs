@@ -437,6 +437,18 @@ impl<T: Storage> RawNode<T> {
         Err(Error::StepPeerNotFound)
     }
 
+    /// Confirms that a witness append was successfully persisted (CAS succeeded).
+    /// See [`Raft::confirm_witness_append`].
+    pub fn confirm_witness_append(&mut self, witness_id: u64) {
+        self.raft.confirm_witness_append(witness_id);
+    }
+
+    /// Notifies that a witness append failed (CAS mismatch or error).
+    /// See [`Raft::reject_witness_append`].
+    pub fn reject_witness_append(&mut self, witness_id: u64) {
+        self.raft.reject_witness_append(witness_id);
+    }
+
     /// A callback when entries are fetched asynchronously.
     /// The context should provide the context passed from Storage.entries().
     /// See more in the comment of Storage.entries().

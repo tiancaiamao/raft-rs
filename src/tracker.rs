@@ -475,6 +475,18 @@ pub struct Epoch {
     /// When witness_subterm[i] == subterm, shortcut replication is active:
     /// the leader synthesizes acks on behalf of the witness.
     pub witness_subterm: [u64; 2],
+    /// The subterm in which a witness append is pending CAS confirmation
+    /// (for each half). 0 means not pending.
+    /// Set to `current_subterm` when `send_append_to_witness` emits a
+    /// WitnessMessage; cleared by `confirm_witness_append` (CAS success) or
+    /// `reject_witness_append` (CAS failure). While pending, `maybe_commit`
+    /// will not re-send — it waits for the external storage layer to report
+    /// the outcome before activating shortcut replication.
+    ///
+    /// Storing the subterm (rather than a plain bool) prevents a stale CAS
+    /// confirmation from a prior subterm from activating shortcut replication
+    /// in the current subterm.
+    pub witness_pending_subterm: [u64; 2],
 }
 
 impl Epoch {
@@ -665,6 +677,12 @@ impl ProgressTracker {
             if *id == perspective_of {
                 pr.recent_active = true;
                 active.insert(*id);
+            } else if pr.is_witness {
+                // Extended Raft: witness is a logical entity backed by etcd.
+                // It is always considered active — its liveness does not depend
+                // on network heartbeats like physical peers.
+                pr.recent_active = true;
+                active.insert(*id);
             } else if pr.recent_active {
                 // It doesn't matter whether it's learner. As we calculate quorum
                 // by actual ids instead of count.
@@ -776,11 +794,10 @@ impl ProgressTracker {
             // Find an inactive node to exclude instead.
             let mut inactive_id = 0u64;
             for (&id, pr) in &self.progress {
-                if !pr.recent_active {
-                    if set.non_witness_voters.contains(&id) || id == set.witness {
-                        inactive_id = id;
-                        break;
-                    }
+                if !pr.recent_active && (set.non_witness_voters.contains(&id) || id == set.witness)
+                {
+                    inactive_id = id;
+                    break;
                 }
             }
 

@@ -39,6 +39,7 @@ pub trait WitnessStorage {
 /// - Last log index, term, subterm (for vote decisions)
 /// - Leader ID
 /// - Replication set (for validating vote requests)
+#[derive(Default)]
 pub struct Witness {
     /// The witness node ID.
     pub id: u64,
@@ -67,22 +68,6 @@ pub struct Witness {
     /// Replication set (non-witness voters that the leader replicates to).
     /// Includes both incoming and outgoing voters during joint consensus.
     pub replication_set: HashSet<u64>,
-}
-
-impl Default for Witness {
-    fn default() -> Self {
-        Self {
-            id: 0,
-            term: 0,
-            vote: 0,
-            last_log_index: 0,
-            last_log_term: 0,
-            last_log_subterm: 0,
-            commit: 0,
-            lead: 0,
-            replication_set: HashSet::default(),
-        }
-    }
 }
 
 impl Witness {

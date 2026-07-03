@@ -92,7 +92,7 @@ impl Configuration {
             heap_arr.as_mut().unwrap().as_mut_slice()
         };
         // Reverse sort.
-        matched.sort_by(|a, b| b.index.cmp(&a.index));
+        matched.sort_by_key(|b| std::cmp::Reverse(b.index));
 
         let quorum = crate::majority(matched.len());
         let quorum_index = matched[quorum - 1];
@@ -151,7 +151,7 @@ impl Configuration {
             heap_arr.as_mut().unwrap().as_mut_slice()
         };
         // Sort descending: matched[0] = highest index, matched[n-1] = lowest.
-        matched.sort_by(|a, b| b.index.cmp(&a.index));
+        matched.sort_by_key(|b| std::cmp::Reverse(b.index));
 
         // We want the index acked by (quorum - 1) voters.
         // quorum = n/2 + 1, so quorum - 1 = n/2.
