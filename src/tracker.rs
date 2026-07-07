@@ -742,20 +742,32 @@ impl ProgressTracker {
             self.epoch.subterm + 1
         };
 
-        for (i, voters) in [&self.conf.voters.incoming, &self.conf.voters.outgoing]
+                        for (i, voters) in [&self.conf.voters.incoming, &self.conf.voters.outgoing]
             .iter()
             .enumerate()
         {
             let set = &mut epoch.replication_sets[i];
             set.excluded = 0;
             set.witness = 0;
+            let mut non_witness_count = 0u64;
             for &id in voters.ids() {
                 if self.conf.witnesses[i] == id {
-                    set.excluded = id;
                     set.witness = id;
                 } else {
                     set.non_witness_voters.insert(id);
+                    non_witness_count += 1;
                 }
+            }
+            // Only exclude the witness from quorum if there are at least 2
+            // non-witness voters. With only 1 non-witness voter, quorum is 2
+            // (out of 2 voters), and the witness must be included to commit.
+            // When excluded, the witness is contacted when q-1 non-witness
+            // voters have acknowledged (a tie-breaker for 3+ voter groups).
+            if set.witness != 0 && non_witness_count >= 2 {
+                set.excluded = set.witness;
+            } else if set.witness != 0 {
+                // Include the witness as a regular voter for quorum.
+                set.non_witness_voters.insert(set.witness);
             }
         }
 
