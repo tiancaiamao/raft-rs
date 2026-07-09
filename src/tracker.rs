@@ -234,8 +234,55 @@ mod tests {
         tracker.apply_conf(conf, changes, 1);
         tracker.reset_replication_set(true);
 
-        assert_eq!(tracker.epoch.replication_sets[0].witness, 0);
+                        assert_eq!(tracker.epoch.replication_sets[0].witness, 0);
         assert_eq!(tracker.epoch.replication_sets[0].excluded, 0);
+    }
+
+    #[test]
+    fn test_reset_replication_set_2_voters_1_witness_includes_witness() {
+        // Voters: [1, 2(witness)], only 1 non-witness voter.
+        // With non_witness_count=1 < 2, the witness must be included as a
+        // regular voter so quorum (2/2) can be reached.
+        let tracker = make_tracker_with_witness(&[1, 2], 2);
+        let epoch = &tracker.epoch;
+
+        assert_eq!(epoch.subterm, 0);
+        assert_eq!(epoch.replication_sets[0].witness, 2);
+        assert_eq!(epoch.replication_sets[0].excluded, 0);
+        assert!(epoch.replication_sets[0].non_witness_voters.contains(&1));
+        assert!(epoch.replication_sets[0].non_witness_voters.contains(&2));
+        assert_eq!(epoch.replication_sets[0].non_witness_voters.len(), 2);
+    }
+
+    #[test]
+    fn test_reset_replication_set_2_voters_replicate_to_witness() {
+        // With 2 voters (1 non-witness + 1 witness), reset should produce
+        // a config where replicate_to_witness() returns (true, false):
+        // witness is needed for quorum and is not excluded.
+        let tracker = make_tracker_with_witness(&[1, 2], 2);
+        let (needs_witness, witness_is_excluded) = tracker.epoch.replicate_to_witness();
+        assert!(needs_witness);
+        assert!(!witness_is_excluded);
+    }
+
+    #[test]
+    fn test_reset_replication_set_2_voters_shortcut_replication() {
+        // With 2 voters (1 non-witness + 1 witness), the witness is in
+        // non_witness_voters. Verify that one_less_than_quorum_in_replication_set
+        // can find the threshold index for shortcut replication.
+        let mut tracker = make_tracker_with_witness(&[1, 2], 2);
+
+        // Set the active voter's matched index.
+        tracker.get_mut(1).unwrap().matched = 42;
+        // Witness (2) has is_witness=true, matched starts at 0.
+
+        let result = tracker.one_less_than_quorum_in_replication_set();
+        assert_eq!(result.len(), 1);
+        // n=2 voters {1, 2}, scope=non_witness_voters={1, 2}.
+        // acked_index(1)=42, acked_index(2)=0.
+        // position = n/2 - 1 = 0 → the max of the sorted values.
+        assert!(result.contains_key(&2));
+        assert_eq!(result[&2], 42);
     }
 
     // ──────────────────────────────────────────────────────────────
