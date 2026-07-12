@@ -212,7 +212,7 @@ impl Cluster {
                     _ => {}
                 }
             }
-                        WitnessResponse::VoteGrant(granted) => {
+            WitnessResponse::VoteGrant(granted) => {
                 let mut m = Message::default();
                 m.set_msg_type(MessageType::MsgRequestVoteResponse);
                 m.from = self.witness_id;

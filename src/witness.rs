@@ -139,7 +139,7 @@ impl Witness {
         }
     }
 
-        fn handle_append(&mut self, msg: &WitnessMessage) -> Option<WitnessResponse> {
+    fn handle_append(&mut self, msg: &WitnessMessage) -> Option<WitnessResponse> {
         // Per Figure 2.4: reject stale-term requests, replying with our
         // (higher) term so the leader learns it must step down.
         if msg.term < self.term {
@@ -348,7 +348,7 @@ impl Witness {
         Some(WitnessResponse::VoteGrant(grant))
     }
 
-        fn handle_heartbeat(&mut self, msg: &WitnessMessage) -> Option<WitnessResponse> {
+    fn handle_heartbeat(&mut self, msg: &WitnessMessage) -> Option<WitnessResponse> {
         // Stale leader: reply with our higher term so it steps down.
         if msg.term < self.term {
             return Some(WitnessResponse::StaleTerm(self.term));
@@ -846,7 +846,7 @@ mod tests {
     }
 
     #[test]
-        fn test_witness_append_stale_term_returns_stale_term() {
+    fn test_witness_append_stale_term_returns_stale_term() {
         // Stale-term append must return StaleTerm so the old leader steps down.
         let mut w = Witness::new(3);
         w.term = 3;
@@ -899,7 +899,7 @@ mod tests {
     }
 
     #[test]
-        fn test_witness_heartbeat_stale_returns_stale_term() {
+    fn test_witness_heartbeat_stale_returns_stale_term() {
         let mut w = Witness::new(3);
         w.term = 5;
 
@@ -1221,7 +1221,7 @@ mod tests {
         w.last_log_index = 6;
         w.replication_set = vec![1, 2, 3, 4].into_iter().collect();
 
-                let msg = make_vote_msg(3, 3, 1, 0, 5, &[3, 4], &[true, true]);
+        let msg = make_vote_msg(3, 3, 1, 0, 5, &[3, 4], &[true, true]);
         let resp = w.process(&msg);
         assert!(matches!(resp, Some(WitnessResponse::VoteGrant(false))));
     }

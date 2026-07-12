@@ -437,12 +437,64 @@ mod tests {
 
         let changed = tracker.change_replication_set();
         assert!(changed);
-        // After change, witness should be back in replication set,
-        // and node 2 (inactive) should be excluded.
+        // After change, node 2 (inactive) should be excluded,
+        // and the witness (3) should be back in the replication set.
         assert_eq!(tracker.epoch.replication_sets[0].excluded, 2);
         assert!(tracker.epoch.replication_sets[0]
             .non_witness_voters
             .contains(&1));
+        assert!(tracker.epoch.replication_sets[0]
+            .non_witness_voters
+            .contains(&3));
+    }
+
+    #[test]
+    fn test_change_replication_set_degrade_swap_unreachable_with_witness() {
+        // Simulate the production bug scenario:
+        // Voters = [43, 44], witness = 230, but witness is NOT in progress map.
+        // After reset: non_witness_voters = {43, 44}, excluded = 230.
+        // Voter 43 goes unreachable → change_replication_set should swap 43 with 230.
+        let mut tracker = ProgressTracker::with_capacity(2, 0, 256);
+
+        let mut conf = Configuration::new(vec![43u64, 44u64], vec![]);
+        conf.witnesses[0] = 230;
+        // Only add regular voters to progress (not the witness).
+        let changes: MapChange = vec![(43, MapChangeType::Add), (44, MapChangeType::Add)]
+            .into_iter()
+            .collect();
+        tracker.apply_conf(conf, changes, 1);
+        tracker.reset_replication_set(true);
+
+        // Verify initial state: witness excluded, both voters in set.
+        assert_eq!(tracker.epoch.replication_sets[0].witness, 230);
+        assert_eq!(tracker.epoch.replication_sets[0].excluded, 230);
+        assert!(tracker.epoch.replication_sets[0]
+            .non_witness_voters
+            .contains(&43));
+        assert!(tracker.epoch.replication_sets[0]
+            .non_witness_voters
+            .contains(&44));
+        // Witness should NOT be in non_witness_voters initially.
+        assert!(!tracker.epoch.replication_sets[0]
+            .non_witness_voters
+            .contains(&230));
+
+        // Voter 44 is active, voter 43 is unreachable.
+        tracker.get_mut(43).unwrap().recent_active = false;
+        tracker.get_mut(44).unwrap().recent_active = true;
+        // Witness has no progress entry (production scenario).
+
+        let changed = tracker.change_replication_set();
+        assert!(changed);
+        let rs = &tracker.epoch.replication_sets[0];
+        // The unreachable voter 43 should now be excluded.
+        assert_eq!(rs.excluded, 43);
+        // Witness (230) should be in non_witness_voters.
+        assert!(rs.non_witness_voters.contains(&44));
+        assert!(rs.non_witness_voters.contains(&230));
+        assert!(!rs.non_witness_voters.contains(&43));
+        // replicate_to_witness should return true (witness in set, not excluded).
+        assert_eq!(tracker.epoch.replicate_to_witness(), (true, false));
     }
 }
 
@@ -805,6 +857,13 @@ impl ProgressTracker {
                     non_witness_count += 1;
                 }
             }
+            // If the witness is configured but is NOT in the voter set
+            // (e.g. 2 regular voters + 1 witness in production), set it
+            // up here. The witness only participates in decision-making
+            // when one regular voter is unreachable.
+            if set.witness == 0 && self.conf.witnesses[i] != 0 {
+                set.witness = self.conf.witnesses[i];
+            }
             // Only exclude the witness from quorum if there are at least 2
             // non-witness voters. With only 1 non-witness voter, quorum is 2
             // (out of 2 voters), and the witness must be included to commit.
@@ -824,6 +883,21 @@ impl ProgressTracker {
     /// Adjusts the replication set based on node liveness.
     /// The leader calls this to exclude inactive nodes or include recovered ones.
     /// Returns true if the replication set changed (caller should start a new subterm).
+    /// Adjusts the replication set based on node liveness.
+    ///
+    /// Per the Extended Raft paper §2.4:
+    /// 1. A new leader initializes its replication set to all regular servers
+    ///    (`RegularServer`). The witness is outside the replication set.
+    /// 2. If leader receives no response from a regular peer server over an
+    ///    election timeout, it assumes the server is unreachable and adjusts
+    ///    the replication set by swapping the unreachable server with the
+    ///    witness (or another reachable regular server).
+    /// 3. As a recovery path, when an excluded node becomes active again,
+    ///    the leader swaps it back into the replication set, excluding an
+    ///    inactive node instead (or clearing the exclusion).
+    ///
+    /// Returns true if the replication set changed (caller should start a
+    /// new subterm and append an empty entry).
     pub fn change_replication_set(&mut self) -> bool {
         let old_epoch = &self.epoch;
         let mut new_epoch = Epoch {
@@ -834,62 +908,102 @@ impl ProgressTracker {
 
         for i in 0..2 {
             let set = &old_epoch.replication_sets[i];
-            if set.excluded == 0 {
-                continue;
-            }
 
-            let excluded_pr = match self.progress.get(&set.excluded) {
-                Some(pr) => pr,
-                None => continue,
-            };
+            // ──────────────────────────────────────────────
+            // Case 1: Recovery — an excluded node is ready
+            // to come back into the replication set.
+            // ──────────────────────────────────────────────
+            if set.excluded != 0 {
+                // Look up the excluded node. A regular voter has a progress
+                // entry. A witness may not have one (witnesses run in external
+                // storage). If not found, skip recovery and fall through to
+                // the degradation check below.
+                if let Some(excluded_pr) = self.progress.get(&set.excluded) {
+                    let is_excluded_ready = excluded_pr.recent_active
+                        && (set.excluded == set.witness
+                            || excluded_pr.state == ProgressState::Replicate);
 
-            // Check if the excluded node is ready (recently active and in replicate state).
-            let is_excluded_ready = excluded_pr.recent_active
-                && (set.excluded == set.witness || excluded_pr.state == ProgressState::Replicate);
-            if !is_excluded_ready {
-                continue;
-            }
+                    if is_excluded_ready {
+                        // Find an inactive node to swap out.
+                        let mut inactive_id = 0u64;
+                        for (&id, pr) in &self.progress {
+                            if !pr.recent_active
+                                && (set.non_witness_voters.contains(&id) || id == set.witness)
+                            {
+                                inactive_id = id;
+                                break;
+                            }
+                        }
 
-            // Find an inactive node to exclude instead.
-            let mut inactive_id = 0u64;
-            for (&id, pr) in &self.progress {
-                if !pr.recent_active && (set.non_witness_voters.contains(&id) || id == set.witness)
-                {
-                    inactive_id = id;
-                    break;
+                                                if inactive_id > 0 || set.excluded != set.witness {
+                            // Build the new non-witness set starting from the
+                            // current one.
+                            let mut new_non_witness = set.non_witness_voters.clone();
+
+                            if inactive_id > 0 {
+                                // Swap: remove the inactive node.
+                                new_non_witness.remove(&inactive_id);
+                            } else {
+                                // No inactive node to swap — the recovered
+                                // node is a regular voter. Re-exclude the
+                                // witness to restore steady state.
+                                new_non_witness.remove(&set.witness);
+                            }
+                            // The old excluded node is now reachable and
+                            // comes back into the replication set.
+                            new_non_witness.insert(set.excluded);
+
+                            new_epoch.replication_sets[i] = ReplicationSet {
+                                witness: set.witness,
+                                excluded: if inactive_id > 0 {
+                                    inactive_id
+                                } else {
+                                    // Re-exclude witness (steady state).
+                                    set.witness
+                                },
+                                non_witness_voters: new_non_witness,
+                            };
+                            changed = true;
+                            continue;
+                        }
+                        // excluded is witness and no inactive found:
+                        // fall through to degradation check below.
+                    }
                 }
+                // If excluded node was not in progress (witness in
+                // production) or not ready, fall through.
             }
 
-            if inactive_id == 0 && set.excluded == set.witness {
-                continue;
-            }
+            // ──────────────────────────────────────────────
+            // Case 2: Degradation — the witness is outside the
+            // replication set. If any non-witness voter inside
+            // the set is unreachable, swap it with the witness.
+            // ──────────────────────────────────────────────
+            //
+            // Per the paper §2.4: "If leader receives no response from
+            // a regular peer server over an election timeout, it assumes
+            // the regular server is unreachable and initiates a
+            // replication set adjustment."
+            if set.witness != 0 && !set.non_witness_voters.contains(&set.witness) {
+                for &id in &set.non_witness_voters {
+                    if let Some(pr) = self.progress.get(&id) {
+                        if !pr.recent_active {
+                            // Found unreachable regular voter.
+                            // Swap it with the witness.
+                            let mut new_non_witness = set.non_witness_voters.clone();
+                            new_non_witness.remove(&id);
+                            new_non_witness.insert(set.witness);
 
-            changed = true;
-            new_epoch.replication_sets[i] = if inactive_id > 0 {
-                ReplicationSet {
-                    witness: old_epoch.replication_sets[i].witness,
-                    excluded: inactive_id,
-                    non_witness_voters: HashSet::default(),
+                            new_epoch.replication_sets[i] = ReplicationSet {
+                                witness: set.witness,
+                                excluded: id,
+                                non_witness_voters: new_non_witness,
+                            };
+                            changed = true;
+                            break;
+                        }
+                    }
                 }
-            } else {
-                ReplicationSet {
-                    witness: old_epoch.replication_sets[i].witness,
-                    excluded: old_epoch.replication_sets[i].witness,
-                    non_witness_voters: HashSet::default(),
-                }
-            };
-
-            // Copy non-witness voters, swapping excluded ↔ new excluded.
-            for &id in &set.non_witness_voters {
-                if id != new_epoch.replication_sets[i].excluded {
-                    new_epoch.replication_sets[i].non_witness_voters.insert(id);
-                }
-            }
-            if set.excluded != new_epoch.replication_sets[i].excluded && set.excluded != set.witness
-            {
-                new_epoch.replication_sets[i]
-                    .non_witness_voters
-                    .insert(set.excluded);
             }
         }
 
