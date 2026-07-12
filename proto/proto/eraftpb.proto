@@ -218,6 +218,12 @@ message WitnessHardState {
     uint64 lead = 5;
     repeated uint64 replication_set = 6;
     repeated uint64 replication_set_outgoing = 7;
+    // Term of the entry at the committed index. Used for vote comparison
+    // — the witness compares the candidate's log against the committed
+    // log, not the received log (which may include uncommitted entries
+    // from shortcut replication).
+    uint64 committed_log_term = 8;
+    uint64 committed_log_subterm = 9;
 }
 
 // WitnessMessage is a message sent between a leader/candidate and a witness.
@@ -241,5 +247,10 @@ message WitnessMessage {
     repeated bool vote_vals = 11;
     bytes context = 12;
     repeated Entry entries = 13;
-    uint64 commit = 14;
+        uint64 commit = 14;
+    // Term/subterm of the entry at the commit index (commit). Used by the
+    // witness to track committed_log_term so it can distinguish committed
+    // entries from uncommitted shortcut-replicated entries when voting.
+    uint64 commit_term = 15;
+    uint64 commit_subterm = 16;
 }

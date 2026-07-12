@@ -234,7 +234,7 @@ mod tests {
         tracker.apply_conf(conf, changes, 1);
         tracker.reset_replication_set(true);
 
-                        assert_eq!(tracker.epoch.replication_sets[0].witness, 0);
+        assert_eq!(tracker.epoch.replication_sets[0].witness, 0);
         assert_eq!(tracker.epoch.replication_sets[0].excluded, 0);
     }
 
@@ -789,7 +789,7 @@ impl ProgressTracker {
             self.epoch.subterm + 1
         };
 
-                        for (i, voters) in [&self.conf.voters.incoming, &self.conf.voters.outgoing]
+        for (i, voters) in [&self.conf.voters.incoming, &self.conf.voters.outgoing]
             .iter()
             .enumerate()
         {

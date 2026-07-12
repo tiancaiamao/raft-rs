@@ -147,7 +147,11 @@ fn test_witness_config_initialization() {
 
     let epoch = &node.raft.prs().epoch;
     assert_eq!(epoch.replication_sets[0].witness, 3);
-    assert_eq!(epoch.replication_sets[0].excluded, 3); // witness initially excluded
+    // With 2 non-witness voters (1,2) + 1 witness (3), quorum = 2.
+    // The witness is excluded from the initial replication set; it
+    // will be added via change_replication_set when a regular server
+    // becomes unreachable (see the paper, §2.4).
+    assert_eq!(epoch.replication_sets[0].excluded, 3);
     assert!(epoch.replication_sets[0].non_witness_voters.contains(&1));
     assert!(epoch.replication_sets[0].non_witness_voters.contains(&2));
     assert!(!epoch.replication_sets[0].non_witness_voters.contains(&3));
@@ -274,18 +278,25 @@ fn test_leader_with_witness_starts_subterm() {
     assert!(node.raft.prs().epoch.has_witness());
 }
 
-/// Helper: set up a leader node where witness is active (not excluded),
-/// simulating the state after change_replication_set excludes an inactive node.
+/// Helper: set up a leader node where witness is active (not excluded).
+/// After the threshold fix, 2 non-witness voters + 1 witness always includes
+/// the witness in non_witness_voters (excluded=0), so change_replication_set
+/// is not needed. We manually set node 2 as excluded and adjust
+/// non_witness_voters to simulate the state where node 2 is inactive.
 fn setup_leader_with_active_witness() -> RawNode<MemStorage> {
     let mut node = make_witness_node(1, vec![1, 2, 3], 3);
     node.raft.become_candidate();
     node.raft.become_leader();
 
-    // Simulate change_replication_set: node 2 is inactive, witness takes over.
-    node.raft.mut_prs().get_mut(1).unwrap().recent_active = true;
-    node.raft.mut_prs().get_mut(2).unwrap().recent_active = false;
-    node.raft.mut_prs().get_mut(3).unwrap().recent_active = true;
-    node.raft.mut_prs().change_replication_set();
+    // Manually set up the replication set so node 2 is excluded and
+    // witness (3) is in non_witness_voters, simulating node 2 being inactive.
+    let epoch = &mut node.raft.mut_prs().epoch;
+    epoch.subterm = 1; // simulate subterm increment
+    let set = &mut epoch.replication_sets[0];
+    set.excluded = 2;
+    set.non_witness_voters.clear();
+    set.non_witness_voters.insert(1);
+    set.non_witness_voters.insert(3);
 
     node
 }
@@ -721,7 +732,8 @@ fn test_joint_state_witness_in_both_replication_sets() {
 
     let epoch = &node.raft.prs().epoch;
 
-    // Incoming: voters = {1,2,3,4}, witness = 3.
+    // Incoming: voters = {1,2,3,4}, witness = 3, 3 non-witness voters.
+    // With >=3 non-witness voters, the witness is excluded.
     let r0 = &epoch.replication_sets[0];
     assert_eq!(r0.witness, 3);
     assert!(r0.non_witness_voters.contains(&1));
@@ -729,9 +741,11 @@ fn test_joint_state_witness_in_both_replication_sets() {
     assert!(r0.non_witness_voters.contains(&4));
     assert!(!r0.non_witness_voters.contains(&3));
 
-    // Outgoing: voters = {1,2,3}, witness = 3.
+    // Outgoing: voters = {1,2,3}, witness = 3, 2 non-witness voters.
+    // With >=2 non-witness voters, the witness is excluded.
     let r1 = &epoch.replication_sets[1];
     assert_eq!(r1.witness, 3);
+    assert_eq!(r1.excluded, 3);
     assert!(r1.non_witness_voters.contains(&1));
     assert!(r1.non_witness_voters.contains(&2));
     assert!(!r1.non_witness_voters.contains(&3));
@@ -776,8 +790,13 @@ fn test_witness_module_reject_stale() {
     w.term = 1;
     w.last_log_term = 2;
     w.last_log_index = 10;
+    // Simulate a witness that has COMMITTED entries at term 2.
+    w.commit = 10;
+    w.committed_log_term = 2;
+    w.committed_log_subterm = 0;
     w.replication_set = vec![1, 2, 3].into_iter().collect();
 
+    // Candidate has last_log_term=1 (stale — behind the committed term).
     let mut msg = WitnessMessage::default();
     msg.set_from(1);
     msg.set_term(2);

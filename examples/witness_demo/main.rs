@@ -212,13 +212,24 @@ impl Cluster {
                     _ => {}
                 }
             }
-            WitnessResponse::VoteGrant(granted) => {
+                        WitnessResponse::VoteGrant(granted) => {
                 let mut m = Message::default();
                 m.set_msg_type(MessageType::MsgRequestVoteResponse);
                 m.from = self.witness_id;
                 m.to = orig.from;
                 m.term = self.witness.term;
                 m.reject = !granted;
+                self.pending_msgs.push(m);
+            }
+            WitnessResponse::StaleTerm(witness_term) => {
+                // Reply with witness's higher term so the stale leader
+                // steps down via step() → become_follower().
+                let mut m = Message::default();
+                m.set_msg_type(MessageType::MsgAppendResponse);
+                m.from = self.witness_id;
+                m.to = orig.from;
+                m.term = witness_term;
+                m.reject = true;
                 self.pending_msgs.push(m);
             }
         }

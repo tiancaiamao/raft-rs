@@ -1030,8 +1030,53 @@ impl<T: Storage> Raft<T> {
 
         msg.entries = entries.into();
 
+        // Set commit info so the witness can track committed_log_term
+        // separately from last_log_term (which may include uncommitted
+        // shortcut-replicated entries).
+        msg.commit = self.raft_log.committed;
+        let (_, commit_term) = self.raft_log.commit_info();
+        msg.commit_term = commit_term;
+        // commit_subterm tracks the epoch subterm for the committed entries.
+        // The current epoch subterm is a safe upper bound: after a subterm
+        // increment (due to replication set change during partition), all new
+        // entries are tagged with this subterm. Setting commit_subterm ensures
+        // the witness updates committed_log_subterm, which is compared in
+        // handle_vote to reject partitioned followers with stale subterms.
+        msg.commit_subterm = self.prs().epoch.subterm;
+
         self.witness_msgs.push(msg);
         true
+    }
+
+    /// Sends a lightweight heartbeat (term check) to a witness.
+    /// Used during MsgCheckQuorum to verify the witness hasn't advanced to a
+    /// higher term (which would mean a new leader was elected during a partition).
+    /// If the witness has a higher term, `witness.process()` returns `None`,
+    /// and the CSE layer steps the leader down.
+    fn send_heartbeat_to_witness(&mut self, witness_id: u64) {
+        let mut msg = WitnessMessage::default();
+        msg.from = self.id;
+        msg.to = witness_id;
+        msg.msg_type = MessageType::MsgHeartbeat;
+        msg.term = self.term;
+        msg.commit = self.raft_log.committed;
+        let (_, commit_term) = self.raft_log.commit_info();
+        msg.commit_term = commit_term;
+        msg.commit_subterm = self.prs().epoch.subterm;
+
+        let epoch = &self.prs.epoch;
+        let r0 = &epoch.replication_sets[0];
+        let r1 = &epoch.replication_sets[1];
+        msg.replication_set_incoming = r0.non_witness_voters.iter().copied().collect();
+        if r0.excluded != r0.witness && r0.excluded != 0 {
+            msg.replication_set_incoming.push(r0.excluded);
+        }
+        msg.replication_set_outgoing = r1.non_witness_voters.iter().copied().collect();
+        if r1.excluded != r1.witness && r1.excluded != 0 {
+            msg.replication_set_outgoing.push(r1.excluded);
+        }
+
+        self.witness_msgs.push(msg);
     }
 
     /// Sends a RequestVote to a witness (Extended Raft).
@@ -1062,6 +1107,13 @@ impl<T: Storage> Raft<T> {
         msg.last_log_term = last_term;
         msg.last_log_subterm = last_subterm;
         msg.last_log_index = last_index;
+
+        // Include commit info so the witness can use committed_log_term
+        // for vote comparison.
+        msg.commit = self.raft_log.committed;
+        let (_, commit_term) = self.raft_log.commit_info();
+        msg.commit_term = commit_term;
+        msg.commit_subterm = 0;
 
         // Include current vote state.
         for (&id, &voted) in votes {
@@ -2361,6 +2413,23 @@ impl<T: Storage> Raft<T> {
                 // because check_quorum_active() resets recent_active flags.
                 if self.has_witness() {
                     self.maybe_start_new_subterm(false, false);
+
+                    // Periodically send a heartbeat to each witness to detect
+                    // term advancement. During a network partition, a new leader
+                    // may be elected at a higher term. Shortcut replication
+                    // prevents the old leader from discovering this (it
+                    // synthesizes witness acks locally). This heartbeat forces
+                    // a real witness I/O every election timeout so the old
+                    // leader can detect the higher term and step down.
+                    let witnesses = [
+                        self.prs().conf().witnesses[0],
+                        self.prs().conf().witnesses[1],
+                    ];
+                    for wid in witnesses {
+                        if wid != 0 {
+                            self.send_heartbeat_to_witness(wid);
+                        }
+                    }
                 }
                 if !self.check_quorum_active() {
                     warn!(
@@ -2609,7 +2678,15 @@ impl<T: Storage> Raft<T> {
                 let witness_ready = self.get_witness_vote_request_readiness(votes_to_win);
                 for (&witness_id, &ready) in &witness_ready {
                     if ready {
-                        self.send_request_vote_to_witness(witness_id, t, self.term);
+                        // For pre-vote, use self.term + 1 (consistent with campaign
+                        // which sends pre-vote to regular peers at self.term + 1).
+                        // For real vote, use self.term.
+                        let vote_term = if t == MessageType::MsgRequestPreVote {
+                            self.term + 1
+                        } else {
+                            self.term
+                        };
+                        self.send_request_vote_to_witness(witness_id, t, vote_term);
                     }
                 }
             }

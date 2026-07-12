@@ -22,6 +22,7 @@ failpoints = ["fail/failpoints"]
 protobuf-codec = ["raft-proto/protobuf-codec", "bytes"]
 prost-codec = ["raft-proto/prost-codec"]
 default-logger = ["slog-stdlog", "slog-envlogger", "slog-term"]
+witness-debug = []
 
 # Make sure to synchronize updates with Harness.
 [dependencies]

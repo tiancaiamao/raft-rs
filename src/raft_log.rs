@@ -710,9 +710,24 @@ impl<T: Storage> RaftLog<T> {
     }
 
     /// Returns the committed index and its term.
+    ///
+    /// When the committed entry has been compacted (snapshot applied), `term()`
+    /// may return 0 because the index falls below `first_index()`. In that case
+    /// fall back to the snapshot boundary term (`first_index - 1`), since the
+    /// committed index is always ≥ the snapshot index (you can only compact
+    /// entries that have been applied, and only committed entries can be
+    /// applied). If even the snapshot term is unavailable, return 0 — the
+    /// caller must handle this gracefully (e.g. the witness keeps its current
+    /// committed_log_term as a safe upper bound).
     pub fn commit_info(&self) -> (u64, u64) {
         match self.term(self.committed) {
-            Ok(t) => (self.committed, t),
+            Ok(t) if t != 0 => (self.committed, t),
+            Ok(_) => {
+                // committed entry has been compacted; use snapshot boundary.
+                let snapshot_idx = self.first_index().saturating_sub(1);
+                let t = self.term(snapshot_idx).unwrap_or(0);
+                (self.committed, t)
+            }
             Err(e) => fatal!(
                 self.unstable.logger,
                 "last committed entry at {} is missing: {:?}",
