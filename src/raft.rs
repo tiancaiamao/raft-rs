@@ -2408,11 +2408,12 @@ impl<T: Storage> Raft<T> {
                 }
                 return Ok(());
             }
-            MessageType::MsgCheckQuorum => {
+                        MessageType::MsgCheckQuorum => {
                 // Extended Raft: adjust replication set BEFORE check_quorum_active(),
                 // because check_quorum_active() resets recent_active flags.
+                let mut adjusted = false;
                 if self.has_witness() {
-                    self.maybe_start_new_subterm(false, false);
+                    adjusted = self.maybe_start_new_subterm(false, false);
 
                     // Periodically send a heartbeat to each witness to detect
                     // term advancement. During a network partition, a new leader
@@ -2431,7 +2432,7 @@ impl<T: Storage> Raft<T> {
                         }
                     }
                 }
-                if !self.check_quorum_active() {
+                if !adjusted && !self.check_quorum_active() {
                     warn!(
                         self.logger,
                         "stepped down to follower since quorum is not active";
