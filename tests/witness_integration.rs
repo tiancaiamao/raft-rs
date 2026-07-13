@@ -483,7 +483,7 @@ fn test_shortcut_replication_new_subterm_allows_contact() {
     node.raft.mut_prs().get_mut(1).unwrap().recent_active = true;
     node.raft.mut_prs().get_mut(2).unwrap().recent_active = false;
     node.raft.mut_prs().get_mut(3).unwrap().recent_active = true;
-    node.raft.mut_prs().change_replication_set();
+    node.raft.mut_prs().change_replication_set(1);
 
     // q-1 again should trigger a new witness contact.
     node.raft.mut_prs().get_mut(1).unwrap().matched = node.raft.raft_log.last_index();
@@ -996,4 +996,255 @@ fn test_check_invariants_rejects_witness_not_in_voters() {
     // Node 3 should be in voters (checked by invariants passing).
     let cs = node.raft.prs().conf().to_conf_state();
     assert!(cs.get_voters().contains(&3));
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// 2F1W degradation tests — commit availability during network partition
+// ═══════════════════════════════════════════════════════════════════
+//
+// These tests reproduce the production bug where a leader in a 2-voter +
+// 1-witness config cannot commit entries when the other regular voter is
+// unreachable. The root cause is that `become_leader` → `reset()` sets all
+// `recent_active` flags to `false`, and `change_replication_set` runs on
+// the first `MsgCheckQuorum` before `check_quorum_active()` has a chance
+// to update them — so the leader itself may be incorrectly swapped out of
+// the replication set.
+
+/// Creates a leader node with 2 non-witness voters + 1 witness.
+///
+/// Voters: {1 (self/leader), 2 (follower)}, Witness: 3.
+/// `check_quorum` is enabled so `MsgCheckQuorum` fires.
+fn make_2f1w_leader() -> RawNode<MemStorage> {
+    let logger = make_logger();
+    let storage = MemStorage::default();
+    let mut cs = ConfState::default();
+    cs.set_voters(vec![1, 2, 3]);
+    cs.set_witness(3);
+    storage.initialize_with_conf_state(cs);
+
+    let config = raft::Config {
+        id: 1,
+        election_tick: 10,
+        heartbeat_tick: 2,
+        check_quorum: true,
+        ..Default::default()
+    };
+    let mut node = RawNode::new(&config, storage, &logger).unwrap();
+    node.raft.become_candidate();
+    node.raft.become_leader();
+    node
+}
+
+/// Simulates persisting all appended entries so the leader's progress
+/// reflects the latest log. Without this, `matched` stays at the old
+/// persisted index and `maybe_commit` can't advance.
+fn persist_appended_entries(node: &mut RawNode<MemStorage>) {
+    let last = node.raft.raft_log.last_index();
+    let committed = node.raft.raft_log.committed;
+    node.raft.raft_log.persisted = last;
+    let pr = node.raft.mut_prs().get_mut(1).unwrap();
+    pr.matched = last;
+    pr.committed_index = committed;
+}
+
+/// Bug reproduction: after `become_leader`, `reset()` sets ALL `recent_active`
+/// to `false`. When `change_replication_set` runs on the first MsgCheckQuorum,
+/// it iterates `non_witness_voters` (a HashSet with non-deterministic order)
+/// and swaps out the FIRST node it finds with `!recent_active`. Because the
+/// leader's `recent_active` is also `false`, the leader may be swapped out of
+/// its own replication set.
+///
+/// This test runs the scenario many times to catch the non-deterministic
+/// failure.
+#[test]
+fn test_2f1w_degradation_does_not_exclude_leader_after_reset() {
+    for _ in 0..100 {
+        let mut node = make_2f1w_leader();
+
+        // After become_leader, reset() set all recent_active = false.
+        assert!(
+            !node.raft.prs().get(1).unwrap().recent_active,
+            "precondition: leader recent_active should be false after reset"
+        );
+        assert!(
+            !node.raft.prs().get(2).unwrap().recent_active,
+            "precondition: follower recent_active should be false after reset"
+        );
+
+        // The initial replication set has witness excluded.
+        let epoch = &node.raft.prs().epoch;
+        assert_eq!(epoch.replication_sets[0].excluded, 3);
+        assert!(epoch.replication_sets[0].non_witness_voters.contains(&1));
+        assert!(epoch.replication_sets[0].non_witness_voters.contains(&2));
+
+        // Simulate the first MsgCheckQuorum: change_replication_set runs
+        // BEFORE check_quorum_active sets recent_active flags.
+        node.raft.mut_prs().change_replication_set(1);
+
+        // After change_replication_set, the leader MUST NOT be excluded.
+        let epoch = &node.raft.prs().epoch;
+        assert_ne!(
+            epoch.replication_sets[0].excluded, 1,
+            "BUG: leader was swapped out of the replication set on the first tick. \
+             This happens because reset() sets all recent_active=false and \
+             change_replication_set runs before check_quorum_active."
+        );
+    }
+}
+
+/// Demonstrates that when the leader correctly detects the unreachable
+/// follower (recent_active=false) and the witness is swapped in, the commit
+/// can proceed via shortcut replication.
+#[test]
+fn test_2f1w_commit_succeeds_after_correct_degradation_swap() {
+    let mut node = make_2f1w_leader();
+    persist_appended_entries(&mut node);
+
+    // Simulate correct liveness state: leader active, follower unreachable.
+    node.raft.mut_prs().get_mut(1).unwrap().recent_active = true;
+    node.raft.mut_prs().get_mut(2).unwrap().recent_active = false;
+    node.raft.mut_prs().get_mut(3).unwrap().recent_active = true;
+
+    // Change replication set: follower 2 should be swapped out, witness 3 in.
+    let changed = node.raft.mut_prs().change_replication_set(1);
+    assert!(changed, "degradation swap should occur");
+
+    let epoch = &node.raft.prs().epoch;
+    assert_eq!(
+        epoch.replication_sets[0].excluded, 2,
+        "follower 2 should be excluded"
+    );
+    assert!(
+        epoch.replication_sets[0].non_witness_voters.contains(&1),
+        "leader should remain in replication set"
+    );
+    assert!(
+        epoch.replication_sets[0].non_witness_voters.contains(&3),
+        "witness should be swapped in"
+    );
+
+    // Start new subterm (appends empty entry).
+    node.raft.maybe_start_new_subterm(false, false);
+    persist_appended_entries(&mut node);
+
+    // Now the witness is in the replication set.
+    // replicate_to_witness should return true for config half 0.
+    let (w0, _w1) = node.raft.prs().epoch.replicate_to_witness();
+    assert!(w0, "witness should need replication");
+
+    // Trigger maybe_commit: q-1 non-witness voters acked → send to witness.
+    let committed_before = node.raft.raft_log.committed;
+    node.raft.maybe_commit();
+
+    // Witness append message should have been generated.
+    let witness_msgs = node.raft.witness_msgs.clone();
+    node.raft.witness_msgs.clear();
+    let append_msgs: Vec<_> = witness_msgs
+        .iter()
+        .filter(|m| m.get_msg_type() == MessageType::MsgAppend)
+        .collect();
+    assert!(
+        !append_msgs.is_empty(),
+        "should have sent append to witness"
+    );
+
+    // Simulate CAS success: confirm_witness_append activates shortcut replication.
+    node.raft.confirm_witness_append(3);
+
+    // Second maybe_commit: synthesized witness ack → commit advances.
+    node.raft.maybe_commit();
+    let committed_after = node.raft.raft_log.committed;
+    assert!(
+        committed_after > committed_before,
+        "commit should advance after witness CAS confirmation. before={}, after={}",
+        committed_before,
+        committed_after
+    );
+}
+
+/// Demonstrates the stuck state: when the witness is excluded from the
+/// replication set and the follower is unreachable, the leader CANNOT commit.
+/// This is the bug observed in production (59-minute outage).
+#[test]
+fn test_2f1w_commit_blocked_with_witness_excluded_and_follower_unreachable() {
+    let mut node = make_2f1w_leader();
+    persist_appended_entries(&mut node);
+
+    // Steady state: witness excluded (excluded=3), non_witness_voters={1,2}.
+    // This is the default after become_leader.
+    let committed_before = node.raft.raft_log.committed;
+
+    // Follower 2 is unreachable (matched=0).
+    node.raft.mut_prs().get_mut(2).unwrap().matched = 0;
+
+    // Try to commit.
+    node.raft.maybe_commit();
+
+    let committed_after = node.raft.raft_log.committed;
+    assert_eq!(
+        committed_before, committed_after,
+        "commit should NOT advance: with witness excluded and follower unreachable, \
+         quorum (2 out of 3 voters) cannot be reached"
+    );
+
+    // Verify the witness shortcut path is not triggered.
+    let (w0, _w1) = node.raft.prs().epoch.replicate_to_witness();
+    assert!(
+        !w0,
+        "replicate_to_witness should be false when witness is excluded (excluded==witness)"
+    );
+}
+
+/// Demonstrates the multi-tick recovery cycle when the leader is incorrectly
+/// swapped out on the first tick. It takes 3 election timeouts to recover to
+/// a working replication set.
+#[test]
+fn test_2f1w_recovery_cycle_when_leader_swapped_on_first_tick() {
+    let mut node = make_2f1w_leader();
+
+    // Force the worst case: leader swapped out on first tick.
+    // Simulate by manually setting the broken state.
+    {
+        let epoch = &mut node.raft.mut_prs().epoch;
+        epoch.subterm = 1;
+        let set = &mut epoch.replication_sets[0];
+        set.excluded = 1; // Leader incorrectly excluded!
+        set.non_witness_voters.clear();
+        set.non_witness_voters.insert(2);
+        set.non_witness_voters.insert(3);
+    }
+
+    // Tick 1: change_replication_set runs.
+    // Current: non_witness={2,3}, excluded=1.
+    // Case 1: excluded=1, recent_active=false → not ready → fall through.
+    // Case 2: witness=3 in non_witness_voters → skip.
+    // No change. check_quorum_active runs: leader self=true, witness=true.
+    // → quorum {1,3} → passes.
+    let changed_tick1 = node.raft.mut_prs().change_replication_set(1);
+    assert!(
+        !changed_tick1,
+        "no change expected on tick 1 with broken state"
+    );
+
+    // Simulate check_quorum_active setting recent_active.
+    node.raft.mut_prs().get_mut(1).unwrap().recent_active = true; // self
+    node.raft.mut_prs().get_mut(2).unwrap().recent_active = false; // unreachable
+    node.raft.mut_prs().get_mut(3).unwrap().recent_active = true; // witness
+
+    // Tick 2: recovery swap.
+    // Case 1: excluded=1, recent_active=true, state=Replicate → ready!
+    // Find inactive: node 2, recent_active=false → inactive_id=2.
+    // Swap: new_non_witness={3,1}, excluded=2.
+    let changed_tick2 = node.raft.mut_prs().change_replication_set(1);
+    assert!(changed_tick2, "recovery swap should occur on tick 2");
+
+    let epoch = &node.raft.prs().epoch;
+    assert_eq!(
+        epoch.replication_sets[0].excluded, 2,
+        "follower 2 should now be excluded"
+    );
+    assert!(
+        epoch.replication_sets[0].non_witness_voters.contains(&1),
+        "leader should be back in the replication set"
+    );
 }

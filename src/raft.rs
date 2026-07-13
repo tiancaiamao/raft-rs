@@ -1379,8 +1379,11 @@ impl<T: Storage> Raft<T> {
     pub fn maybe_start_new_subterm(&mut self, new_term: bool, conf_change: bool) -> bool {
         if new_term || conf_change {
             self.mut_prs().reset_replication_set(new_term);
-        } else if !self.mut_prs().change_replication_set() {
-            return false;
+        } else {
+            let leader_id = self.id;
+            if !self.mut_prs().change_replication_set(leader_id) {
+                return false;
+            }
         }
 
         if !self.append_entry(&mut [Entry::default()]) {
@@ -2408,7 +2411,7 @@ impl<T: Storage> Raft<T> {
                 }
                 return Ok(());
             }
-                        MessageType::MsgCheckQuorum => {
+            MessageType::MsgCheckQuorum => {
                 // Extended Raft: adjust replication set BEFORE check_quorum_active(),
                 // because check_quorum_active() resets recent_active flags.
                 let mut adjusted = false;

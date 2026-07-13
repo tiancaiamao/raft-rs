@@ -421,7 +421,7 @@ mod tests {
             tracker.get_mut(*id).unwrap().recent_active = true;
         }
 
-        let changed = tracker.change_replication_set();
+        let changed = tracker.change_replication_set(1);
         assert!(!changed);
     }
 
@@ -435,7 +435,7 @@ mod tests {
         // Witness (3) is excluded and active.
         tracker.get_mut(3).unwrap().recent_active = true;
 
-        let changed = tracker.change_replication_set();
+        let changed = tracker.change_replication_set(1);
         assert!(changed);
         // After change, node 2 (inactive) should be excluded,
         // and the witness (3) should be back in the replication set.
@@ -479,12 +479,12 @@ mod tests {
             .non_witness_voters
             .contains(&230));
 
-        // Voter 44 is active, voter 43 is unreachable.
+        // Voter 44 is active (and is the leader), voter 43 is unreachable.
         tracker.get_mut(43).unwrap().recent_active = false;
         tracker.get_mut(44).unwrap().recent_active = true;
         // Witness has no progress entry (production scenario).
 
-        let changed = tracker.change_replication_set();
+        let changed = tracker.change_replication_set(44);
         assert!(changed);
         let rs = &tracker.epoch.replication_sets[0];
         // The unreachable voter 43 should now be excluded.
@@ -898,7 +898,14 @@ impl ProgressTracker {
     ///
     /// Returns true if the replication set changed (caller should start a
     /// new subterm and append an empty entry).
-    pub fn change_replication_set(&mut self) -> bool {
+    /// Adjusts the replication set based on liveness information.
+    ///
+    /// Implements the AdjustReplicationSet action from the Extended Raft
+    /// paper §2.4. Per the formal spec (Figure 2.5), the server swapped
+    /// *out* of the replication set must never be the leader:
+    ///   `choose x ∈ replicationSet[i] : x ≠ i`
+    /// This invariant is enforced via the `leader_id` parameter.
+    pub fn change_replication_set(&mut self, leader_id: u64) -> bool {
         let old_epoch = &self.epoch;
         let mut new_epoch = Epoch {
             subterm: old_epoch.subterm + 1,
@@ -925,9 +932,12 @@ impl ProgressTracker {
 
                     if is_excluded_ready {
                         // Find an inactive node to swap out.
+                        // Per the paper, the leader (i) must never be
+                        // chosen as the node to swap out (x ≠ i).
                         let mut inactive_id = 0u64;
                         for (&id, pr) in &self.progress {
                             if !pr.recent_active
+                                && id != leader_id
                                 && (set.non_witness_voters.contains(&id) || id == set.witness)
                             {
                                 inactive_id = id;
@@ -935,7 +945,7 @@ impl ProgressTracker {
                             }
                         }
 
-                                                if inactive_id > 0 || set.excluded != set.witness {
+                        if inactive_id > 0 || set.excluded != set.witness {
                             // Build the new non-witness set starting from the
                             // current one.
                             let mut new_non_witness = set.non_witness_voters.clone();
@@ -987,7 +997,11 @@ impl ProgressTracker {
             if set.witness != 0 && !set.non_witness_voters.contains(&set.witness) {
                 for &id in &set.non_witness_voters {
                     if let Some(pr) = self.progress.get(&id) {
-                        if !pr.recent_active {
+                        // Per the paper (Figure 2.5), the leader must
+                        // never be swapped out of its own replication
+                        // set (choose x : x ≠ i). The leader is always
+                        // reachable from itself.
+                        if !pr.recent_active && id != leader_id {
                             // Found unreachable regular voter.
                             // Swap it with the witness.
                             let mut new_non_witness = set.non_witness_voters.clone();
