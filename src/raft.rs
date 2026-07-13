@@ -1010,7 +1010,7 @@ impl<T: Storage> Raft<T> {
         let mut msg = WitnessMessage::default();
         msg.from = self.id;
         msg.to = witness_id;
-        msg.msg_type = MessageType::MsgAppend;
+        msg.set_msg_type(MessageType::MsgAppend);
         msg.term = self.term;
         msg.last_log_term = first.term;
         msg.last_log_subterm = first.subterm;
@@ -1057,7 +1057,7 @@ impl<T: Storage> Raft<T> {
         let mut msg = WitnessMessage::default();
         msg.from = self.id;
         msg.to = witness_id;
-        msg.msg_type = MessageType::MsgHeartbeat;
+        msg.set_msg_type(MessageType::MsgHeartbeat);
         msg.term = self.term;
         msg.commit = self.raft_log.committed;
         let (_, commit_term) = self.raft_log.commit_info();
@@ -1102,7 +1102,7 @@ impl<T: Storage> Raft<T> {
         let mut msg = WitnessMessage::default();
         msg.from = self.id;
         msg.to = witness_id;
-        msg.msg_type = vote_msg_type;
+        msg.set_msg_type(vote_msg_type);
         msg.term = term;
         msg.last_log_term = last_term;
         msg.last_log_subterm = last_subterm;
@@ -1240,6 +1240,17 @@ impl<T: Storage> Raft<T> {
             }
             self.mut_prs().epoch.witness_subterm[half] = current_subterm;
             self.mut_prs().epoch.witness_pending_subterm[half] = 0;
+
+            // Immediately re-check commit. Now that witness_subterm is set,
+            // maybe_commit's shortcut replication will synthesize the witness
+            // ack, which may advance maximal_committed_index and commit the
+            // no-op entry. Without this call, the leader waits for the next
+            // MsgBeat or MsgCheckQuorum tick, introducing an unnecessary
+            // delay (up to election timeout).
+            if self.state == StateRole::Leader && self.maybe_commit() && self.should_bcast_commit()
+            {
+                self.bcast_append();
+            }
         }
     }
 
@@ -2425,17 +2436,46 @@ impl<T: Storage> Raft<T> {
                     // synthesizes witness acks locally). This heartbeat forces
                     // a real witness I/O every election timeout so the old
                     // leader can detect the higher term and step down.
+                    //
+                    // However, we skip the heartbeat if an append CAS is
+                    // already in flight (witness_pending_subterm != 0).
+                    // Sending a heartbeat during an in-flight append creates
+                    // a CAS race: the heartbeat's CAS changes the storage
+                    // version, causing the append's CAS to fail, which
+                    // prevents shortcut replication from ever activating
+                    // and blocks commit indefinitely.
                     let witnesses = [
                         self.prs().conf().witnesses[0],
                         self.prs().conf().witnesses[1],
                     ];
                     for wid in witnesses {
                         if wid != 0 {
-                            self.send_heartbeat_to_witness(wid);
+                            let half = self.witness_config_half(wid);
+                            let append_in_flight = half
+                                .is_some_and(|h| self.prs().epoch.witness_pending_subterm[h] != 0);
+                            if append_in_flight {
+                                debug!(
+                                    self.logger,
+                                    "skipping witness heartbeat: append CAS in flight";
+                                    "witness_id" => wid,
+                                );
+                            } else {
+                                self.send_heartbeat_to_witness(wid);
+                            }
                         }
                     }
                 }
-                if !adjusted && !self.check_quorum_active() {
+                // In degraded mode the witness is in the replication set to
+                // replace an unreachable regular voter. check_quorum_active()
+                // uses conf.voters (the original voter set) rather than the
+                // replication set, so it cannot detect that {leader + witness}
+                // forms a valid quorum. Skip the check — the leader has already
+                // verified unreachability during change_replication_set() above.
+                let witness_active = self
+                    .has_witness()
+                    .then(|| self.prs().epoch.replicate_to_witness());
+                let degraded = witness_active.is_some_and(|r| r.0 || r.1);
+                if !adjusted && !degraded && !self.check_quorum_active() {
                     warn!(
                         self.logger,
                         "stepped down to follower since quorum is not active";

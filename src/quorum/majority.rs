@@ -272,7 +272,7 @@ impl Configuration {
             }
         }
 
-        info.sort_by(|a, b| a.id.cmp(&b.id));
+        info.sort_by_key(|a| a.id);
 
         let mut buf = String::new();
         buf.push_str(" ".repeat(n).as_str());

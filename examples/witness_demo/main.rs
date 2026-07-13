@@ -16,7 +16,7 @@ use std::collections::{HashMap, HashSet};
 
 use raft::eraftpb::WitnessMessage;
 use raft::prelude::*;
-use raft::protocompat::PbMessage;
+use raft::protocompat::*;
 use raft::storage::MemStorage;
 use raft::witness::{Witness, WitnessResponse};
 use raft::StateRole;
@@ -187,7 +187,7 @@ impl Cluster {
             WitnessResponse::Persist(state) => {
                 let term = state.get_state().term;
                 let commit = state.get_state().commit;
-                match orig.msg_type {
+                match orig.get_msg_type() {
                     MessageType::MsgAppend => {
                         self.witness_append_count += 1;
                         let mut m = Message::default();

@@ -67,3 +67,4 @@ path = "examples/five_mem_node/main.rs"
 [[example]]
 name = "witness_demo"
 path = "examples/witness_demo/main.rs"
+required-features = ["default-logger"]

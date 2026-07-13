@@ -130,7 +130,7 @@ impl Witness {
     /// The response (if any) is a regular Message that should be sent back to the
     /// leader/candidate via the normal Raft message channel.
     pub fn process(&mut self, msg: &WitnessMessage) -> Option<WitnessResponse> {
-        match msg.msg_type {
+        match msg.get_msg_type() {
             MessageType::MsgAppend => self.handle_append(msg),
             MessageType::MsgRequestVote => self.handle_vote(msg, false),
             MessageType::MsgRequestPreVote => self.handle_vote(msg, true),
@@ -208,10 +208,10 @@ impl Witness {
             return None;
         }
 
-        let old_term = self.term;
-        let old_committed_log_term = self.committed_log_term;
+        let _old_term = self.term;
+        let _old_committed_log_term = self.committed_log_term;
         let _old_committed_log_subterm = self.committed_log_subterm;
-        let old_replication_set = self.replication_set.clone();
+        let _old_replication_set = self.replication_set.clone();
 
         // Update term if needed — only for real votes, not pre-votes.
         // Pre-votes must not advance the witness term; doing so would cause
@@ -323,9 +323,9 @@ impl Witness {
              replication_set={:?} vote_ids={:?} vote_vals={:?} last_log_index={} commit={}",
             is_pre_vote,
             grant,
-            old_term,
+            _old_term,
             self.term,
-            old_committed_log_term,
+            _old_committed_log_term,
             self.committed_log_term,
             self.committed_log_subterm,
             msg.term,
@@ -334,7 +334,7 @@ impl Witness {
             log_ok,
             can_vote,
             replication_set_ok,
-            old_replication_set,
+            _old_replication_set,
             msg.vote_ids,
             msg.vote_vals,
             msg.last_log_index,
@@ -417,7 +417,7 @@ mod tests {
         let mut msg = WitnessMessage::default();
         msg.from = from;
         msg.term = term;
-        msg.msg_type = MessageType::MsgRequestVote;
+        msg.set_msg_type(MessageType::MsgRequestVote);
         msg.last_log_term = last_log_term;
         msg.last_log_subterm = last_log_subterm;
         msg.last_log_index = last_log_index;
@@ -438,7 +438,7 @@ mod tests {
         let mut msg = WitnessMessage::default();
         msg.from = from;
         msg.term = term;
-        msg.msg_type = MessageType::MsgAppend;
+        msg.set_msg_type(MessageType::MsgAppend);
         msg.commit = commit;
         if !entries.is_empty() {
             let first = entries[0];
@@ -476,7 +476,7 @@ mod tests {
         let mut msg = WitnessMessage::default();
         msg.from = 1;
         msg.term = 2;
-        msg.msg_type = MessageType::MsgRequestVote;
+        msg.set_msg_type(MessageType::MsgRequestVote);
         msg.last_log_term = 1;
         msg.last_log_index = 5;
         msg.last_log_subterm = 0;
@@ -505,7 +505,7 @@ mod tests {
         let mut msg = WitnessMessage::default();
         msg.from = 1;
         msg.term = 2;
-        msg.msg_type = MessageType::MsgRequestVote;
+        msg.set_msg_type(MessageType::MsgRequestVote);
         msg.last_log_term = 1; // Stale
         msg.last_log_index = 5;
         msg.vote_ids = vec![1];
@@ -742,7 +742,7 @@ mod tests {
         w.replication_set = vec![1, 2, 3].into_iter().collect();
 
         let mut msg = make_vote_msg(1, 5, 3, 2, 10, &[1], &[true]);
-        msg.msg_type = MessageType::MsgRequestPreVote;
+        msg.set_msg_type(MessageType::MsgRequestPreVote);
         let resp = w.process(&msg);
         assert!(matches!(resp, Some(WitnessResponse::VoteGrant(true))));
         assert_eq!(w.vote, 0); // Pre-vote should NOT set vote.
@@ -766,7 +766,7 @@ mod tests {
         let mut msg = WitnessMessage::default();
         msg.from = 1;
         msg.term = 1;
-        msg.msg_type = MessageType::MsgAppend;
+        msg.set_msg_type(MessageType::MsgAppend);
         msg.last_log_index = 5;
         msg.last_log_term = 1;
         msg.entries = vec![entry].into();
@@ -836,7 +836,7 @@ mod tests {
         let mut msg = WitnessMessage::default();
         msg.from = 1;
         msg.term = 1;
-        msg.msg_type = MessageType::MsgAppend;
+        msg.set_msg_type(MessageType::MsgAppend);
         msg.commit = 3;
 
         let resp = w.process(&msg);
@@ -871,7 +871,7 @@ mod tests {
         let mut msg = WitnessMessage::default();
         msg.from = 1;
         msg.term = 2;
-        msg.msg_type = MessageType::MsgHeartbeat;
+        msg.set_msg_type(MessageType::MsgHeartbeat);
         msg.commit = 5;
 
         let resp = w.process(&msg);
@@ -889,7 +889,7 @@ mod tests {
         let mut msg = WitnessMessage::default();
         msg.from = 2;
         msg.term = 3;
-        msg.msg_type = MessageType::MsgHeartbeat;
+        msg.set_msg_type(MessageType::MsgHeartbeat);
 
         let resp = w.process(&msg);
         assert!(matches!(resp, Some(WitnessResponse::Persist(_))));
@@ -906,7 +906,7 @@ mod tests {
         let mut msg = WitnessMessage::default();
         msg.from = 1;
         msg.term = 3;
-        msg.msg_type = MessageType::MsgHeartbeat;
+        msg.set_msg_type(MessageType::MsgHeartbeat);
 
         let resp = w.process(&msg);
         assert!(matches!(resp, Some(WitnessResponse::StaleTerm(5))));
@@ -921,7 +921,7 @@ mod tests {
         let mut msg = WitnessMessage::default();
         msg.from = 1;
         msg.term = 2;
-        msg.msg_type = MessageType::MsgHeartbeat;
+        msg.set_msg_type(MessageType::MsgHeartbeat);
         msg.commit = 5; // lower
 
         let resp = w.process(&msg);
@@ -973,7 +973,7 @@ mod tests {
         let mut msg = WitnessMessage::default();
         msg.from = 1;
         msg.term = 2;
-        msg.msg_type = MessageType::MsgPropose;
+        msg.set_msg_type(MessageType::MsgPropose);
 
         let resp = w.process(&msg);
         assert!(resp.is_none());
@@ -1070,7 +1070,7 @@ mod tests {
         w.replication_set = HashSet::new(); // empty!
 
         let mut msg = make_vote_msg(277, 7, 6, 0, 5, &[276, 277], &[false, true]);
-        msg.msg_type = MessageType::MsgRequestPreVote;
+        msg.set_msg_type(MessageType::MsgRequestPreVote);
 
         let resp = w.process(&msg);
         eprintln!("\n=== WITNESS_DEBUG_TEST ===");
@@ -1098,7 +1098,7 @@ mod tests {
 
         // Step 1: First pre-vote at term 6
         let mut msg1 = make_vote_msg(277, 6, 5, 0, 4, &[277], &[true]);
-        msg1.msg_type = MessageType::MsgRequestPreVote;
+        msg1.set_msg_type(MessageType::MsgRequestPreVote);
         let resp1 = w.process(&msg1);
         eprintln!("\n=== Step 1: First pre-vote ===");
         eprintln!("result: {:?}", resp1);
@@ -1110,7 +1110,7 @@ mod tests {
 
         // Step 2: Real vote at term 6
         let mut msg2 = make_vote_msg(277, 6, 5, 0, 4, &[276, 277], &[false, true]);
-        msg2.msg_type = MessageType::MsgRequestVote;
+        msg2.set_msg_type(MessageType::MsgRequestVote);
         let resp2 = w.process(&msg2);
         eprintln!("\n=== Step 2: Real vote ===");
         eprintln!("result: {:?}", resp2);
@@ -1132,7 +1132,7 @@ mod tests {
         // Step 3: Leader heartbeat at term 7
         let mut msg3 = WitnessMessage::default();
         msg3.from = 276;
-        msg3.msg_type = MessageType::MsgHeartbeat;
+        msg3.set_msg_type(MessageType::MsgHeartbeat);
         msg3.term = 7;
         msg3.commit = 5;
         let resp3 = w.process(&msg3);
@@ -1146,7 +1146,7 @@ mod tests {
 
         // Step 4: Second pre-vote at term 7 (another candidate)
         let mut msg4 = make_vote_msg(277, 7, 6, 0, 5, &[276, 277], &[false, true]);
-        msg4.msg_type = MessageType::MsgRequestPreVote;
+        msg4.set_msg_type(MessageType::MsgRequestPreVote);
         let resp4 = w.process(&msg4);
         eprintln!("\n=== Step 4: Second pre-vote ===");
         eprintln!("result: {:?}", resp4);
@@ -1157,7 +1157,7 @@ mod tests {
 
         // Step 5: Real vote at term 7 (second election)
         let mut msg5 = make_vote_msg(277, 7, 6, 0, 5, &[276, 277], &[false, true]);
-        msg5.msg_type = MessageType::MsgRequestVote;
+        msg5.set_msg_type(MessageType::MsgRequestVote);
         let resp5 = w.process(&msg5);
         eprintln!("\n=== Step 5: Second real vote ===");
         eprintln!("result: {:?}", resp5);
@@ -1254,7 +1254,7 @@ mod tests {
         let mut msg = WitnessMessage::default();
         msg.from = 1;
         msg.term = 2; // stale
-        msg.msg_type = MessageType::MsgHeartbeat;
+        msg.set_msg_type(MessageType::MsgHeartbeat);
         msg.commit = 5;
 
         let resp = w.process(&msg);

@@ -2,6 +2,11 @@
 
 //! Integration tests for Extended Raft witness functionality.
 
+// `.into()` on enum fields is needed for prost-codec (where fields are i32)
+// but is a no-op for protobuf-codec. Allow the useless_conversion lint to
+// support both codecs.
+#![allow(clippy::useless_conversion)]
+
 use raft::eraftpb::{
     ConfChangeSingle, ConfChangeType, ConfState, Entry, MessageType, WitnessHardState,
     WitnessMessage,
@@ -53,7 +58,7 @@ fn test_witness_message_proto() {
     msg.set_last_log_index(10);
     msg.set_last_log_term(2);
     msg.set_last_log_subterm(3);
-    msg.replication_set_incoming = vec![1, 2].into();
+    msg.replication_set_incoming = vec![1, 2];
     msg.vote_ids = vec![1, 2];
     msg.vote_vals = vec![true, true];
 
@@ -68,11 +73,11 @@ fn test_witness_message_proto() {
 fn test_conf_change_add_witness_type() {
     let cc = ConfChangeType::AddWitness;
     let single = ConfChangeSingle {
-        change_type: cc,
+        change_type: cc.into(),
         node_id: 3,
         ..Default::default()
     };
-    assert_eq!(single.change_type, ConfChangeType::AddWitness);
+    assert_eq!(single.get_change_type(), ConfChangeType::AddWitness);
 }
 
 #[test]
@@ -238,12 +243,14 @@ fn test_leader_election_with_witness() {
     assert_eq!(node.raft.state, raft::StateRole::Candidate);
 
     // Simulate node 2 granting vote.
-    let mut vote_resp = raft::eraftpb::Message::default();
-    vote_resp.msg_type = MessageType::MsgRequestVoteResponse;
-    vote_resp.from = 2;
-    vote_resp.to = 1;
-    vote_resp.term = node.raft.term;
-    vote_resp.reject = false;
+    let vote_resp = raft::eraftpb::Message {
+        msg_type: MessageType::MsgRequestVoteResponse.into(),
+        from: 2,
+        to: 1,
+        term: node.raft.term,
+        reject: false,
+        ..Default::default()
+    };
     node.raft.step(vote_resp).unwrap();
 
     // After getting node 2's vote, candidate should be pending.
@@ -366,9 +373,11 @@ fn test_shortcut_replication_synthesizes_second_ack() {
     let witness_matched_after_first = node.raft.prs().get(3).unwrap().matched;
 
     // Append a new entry and ack it.
-    let mut entry = Entry::default();
-    entry.term = node.raft.term;
-    entry.subterm = node.raft.prs().epoch.subterm;
+    let entry = Entry {
+        term: node.raft.term,
+        subterm: node.raft.prs().epoch.subterm,
+        ..Default::default()
+    };
     let _ = node.raft.append_entry(&mut [entry]);
     node.raft.raft_log.persisted = node.raft.raft_log.last_index();
     node.raft.mut_prs().get_mut(1).unwrap().matched = node.raft.raft_log.last_index();
@@ -412,9 +421,11 @@ fn test_shortcut_replication_blocked_until_cas_confirmed() {
     let witness_matched_before = node.raft.prs().get(3).unwrap().matched;
 
     // Append a new entry and ack from voter 1.
-    let mut entry = Entry::default();
-    entry.term = node.raft.term;
-    entry.subterm = node.raft.prs().epoch.subterm;
+    let entry = Entry {
+        term: node.raft.term,
+        subterm: node.raft.prs().epoch.subterm,
+        ..Default::default()
+    };
     let _ = node.raft.append_entry(&mut [entry]);
     node.raft.raft_log.persisted = node.raft.raft_log.last_index();
     node.raft.mut_prs().get_mut(1).unwrap().matched = node.raft.raft_log.last_index();
@@ -508,7 +519,7 @@ fn test_shortcut_replication_new_subterm_allows_contact() {
 // Helper: create a ConfChangeV2 that forces joint consensus via Implicit transition.
 fn joint_conf_change(changes: Vec<ConfChangeSingle>) -> raft::eraftpb::ConfChangeV2 {
     raft::eraftpb::ConfChangeV2 {
-        transition: raft::eraftpb::ConfChangeTransition::Implicit,
+        transition: raft::eraftpb::ConfChangeTransition::Implicit.into(),
         changes: changes.into(),
         ..Default::default()
     }
@@ -517,14 +528,14 @@ fn joint_conf_change(changes: Vec<ConfChangeSingle>) -> raft::eraftpb::ConfChang
 // Helper: create a ConfChangeV2 that leaves joint state.
 fn leave_joint_cc() -> raft::eraftpb::ConfChangeV2 {
     raft::eraftpb::ConfChangeV2 {
-        transition: raft::eraftpb::ConfChangeTransition::Auto,
+        transition: raft::eraftpb::ConfChangeTransition::Auto.into(),
         ..Default::default()
     }
 }
 
 fn add_node(id: u64) -> ConfChangeSingle {
     ConfChangeSingle {
-        change_type: ConfChangeType::AddNode,
+        change_type: ConfChangeType::AddNode.into(),
         node_id: id,
         ..Default::default()
     }
@@ -532,7 +543,7 @@ fn add_node(id: u64) -> ConfChangeSingle {
 
 fn remove_node(id: u64) -> ConfChangeSingle {
     ConfChangeSingle {
-        change_type: ConfChangeType::RemoveNode,
+        change_type: ConfChangeType::RemoveNode.into(),
         node_id: id,
         ..Default::default()
     }
@@ -658,7 +669,7 @@ fn test_conf_change_add_witness() {
     // Add node 4 as witness.
     let cc = raft::eraftpb::ConfChangeV2 {
         changes: vec![ConfChangeSingle {
-            change_type: ConfChangeType::AddWitness,
+            change_type: ConfChangeType::AddWitness.into(),
             node_id: 4,
             ..Default::default()
         }]
@@ -884,7 +895,7 @@ fn test_joint_remove_old_witness_add_new_witness() {
     let cc = joint_conf_change(vec![
         remove_node(3),
         ConfChangeSingle {
-            change_type: ConfChangeType::AddWitness,
+            change_type: ConfChangeType::AddWitness.into(),
             node_id: 4,
             ..Default::default()
         },
@@ -937,8 +948,8 @@ fn test_witness_vote_joint_consensus_validation() {
     append_msg.set_last_log_term(1);
     append_msg.set_last_log_index(5);
     append_msg.set_last_log_subterm(1);
-    append_msg.replication_set_incoming = vec![1, 2].into(); // incoming non-witness voters
-    append_msg.replication_set_outgoing = vec![1, 3].into(); // outgoing non-witness voters
+    append_msg.replication_set_incoming = vec![1, 2]; // incoming non-witness voters
+    append_msg.replication_set_outgoing = vec![1, 3]; // outgoing non-witness voters
     w.process(&append_msg);
 
     // Witness should know about all voters from both halves.
@@ -982,7 +993,7 @@ fn test_check_invariants_rejects_witness_not_in_voters() {
     // Add witness node 3 — should succeed and add to voters.
     let cc = raft::eraftpb::ConfChangeV2 {
         changes: vec![ConfChangeSingle {
-            change_type: ConfChangeType::AddWitness,
+            change_type: ConfChangeType::AddWitness.into(),
             node_id: 3,
             ..Default::default()
         }]
