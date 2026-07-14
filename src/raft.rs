@@ -999,14 +999,38 @@ impl<T: Storage> Raft<T> {
         );
         let entries = match entries {
             Ok(e) => e,
-            Err(Error::Store(StorageError::LogTemporarilyUnavailable)) => return false,
-            Err(_) => return false,
+            Err(Error::Store(StorageError::LogTemporarilyUnavailable)) => {
+                info!(
+                    self.logger,
+                    "send_append_to_witness: entries temporarily unavailable";
+                    "witness_id" => witness_id,
+                    "next_idx" => next_idx,
+                );
+                return false;
+            }
+            Err(e) => {
+                info!(
+                    self.logger,
+                    "send_append_to_witness: entries error";
+                    "witness_id" => witness_id,
+                    "error" => ?e,
+                );
+                return false;
+            }
         };
         if entries.is_empty() {
+            info!(
+                self.logger,
+                "send_append_to_witness: no entries to send";
+                "witness_id" => witness_id,
+                "next_idx" => next_idx,
+            );
             return false;
         }
 
         let first = &entries[0];
+        let num_entries = entries.len();
+        let first_index = first.index;
         let mut msg = WitnessMessage::default();
         msg.from = self.id;
         msg.to = witness_id;
@@ -1045,6 +1069,15 @@ impl<T: Storage> Raft<T> {
         msg.commit_subterm = self.prs().epoch.subterm;
 
         self.witness_msgs.push(msg);
+        info!(
+            self.logger,
+            "send_append_to_witness: sent";
+            "witness_id" => witness_id,
+            "first_index" => first_index,
+            "num_entries" => num_entries,
+            "term" => self.term,
+            "subterm" => self.prs().epoch.subterm,
+        );
         true
     }
 
@@ -1217,6 +1250,34 @@ impl<T: Storage> Raft<T> {
                 .update_committed(committed);
             return true;
         }
+
+                // Diagnostic: log when a leader with witnesses cannot commit.
+        // This is the key signal for partition-recovery write stalls.
+        // Only log when there are actually pending entries (mci > committed);
+        // otherwise the leader is simply idle and the message is noise.
+        if self.state == StateRole::Leader && self.has_witness() && mci > self.raft_log.committed
+        {
+            let peer_states: Vec<(u64, u64, bool)> = self
+                .prs()
+                .progress()
+                .iter()
+                .map(|(&id, pr)| (id, pr.matched, pr.recent_active))
+                .collect();
+            let r0 = &self.prs().epoch.replication_sets[0];
+            info!(
+                self.logger,
+                "maybe_commit failed; no quorum yet";
+                "term" => self.term,
+                "committed" => self.raft_log.committed,
+                "mci" => mci,
+                "peers" => ?peer_states,
+                "witness" => r0.witness,
+                "excluded" => r0.excluded,
+                "non_witness_voters" => ?r0.non_witness_voters,
+                "witness_subterm" => ?self.prs().epoch.witness_subterm,
+                "witness_pending_subterm" => ?self.prs().epoch.witness_pending_subterm,
+            );
+        }
         false
     }
 
@@ -1236,10 +1297,24 @@ impl<T: Storage> Raft<T> {
             // in-flight CAS belongs to the old subterm and must not activate
             // shortcut replication for the current one.
             if self.prs().epoch.witness_pending_subterm[half] != current_subterm {
+                info!(
+                    self.logger,
+                    "confirm_witness_append: stale, ignoring";
+                    "witness_id" => witness_id,
+                    "pending_subterm" => self.prs().epoch.witness_pending_subterm[half],
+                    "current_subterm" => current_subterm,
+                );
                 return;
             }
             self.mut_prs().epoch.witness_subterm[half] = current_subterm;
             self.mut_prs().epoch.witness_pending_subterm[half] = 0;
+
+            info!(
+                self.logger,
+                "confirm_witness_append: shortcut replication activated";
+                "witness_id" => witness_id,
+                "subterm" => current_subterm,
+            );
 
             // Immediately re-check commit. Now that witness_subterm is set,
             // maybe_commit's shortcut replication will synthesize the witness
@@ -1265,9 +1340,22 @@ impl<T: Storage> Raft<T> {
             let current_subterm = self.prs().epoch.subterm;
             // Guard against stale rejections, same rationale as confirm.
             if self.prs().epoch.witness_pending_subterm[half] != current_subterm {
+                info!(
+                    self.logger,
+                    "reject_witness_append: stale, ignoring";
+                    "witness_id" => witness_id,
+                    "pending_subterm" => self.prs().epoch.witness_pending_subterm[half],
+                    "current_subterm" => current_subterm,
+                );
                 return;
             }
             self.mut_prs().epoch.witness_pending_subterm[half] = 0;
+            info!(
+                self.logger,
+                "reject_witness_append: CAS failed, will retry";
+                "witness_id" => witness_id,
+                "subterm" => current_subterm,
+            );
         }
     }
 
@@ -1403,11 +1491,20 @@ impl<T: Storage> Raft<T> {
         }
 
         let subterm = self.prs.epoch.subterm;
-        debug!(
+        let (r0, r1) = (
+            &self.prs().epoch.replication_sets[0],
+            &self.prs().epoch.replication_sets[1],
+        );
+        info!(
             self.logger,
-            "started new subterm. Term: {}, Subterm: {}",
-            self.term,
-            subterm;
+            "started new subterm";
+            "term" => self.term,
+            "subterm" => subterm,
+            "r0_witness" => r0.witness,
+            "r0_excluded" => r0.excluded,
+            "r0_non_witness_voters" => ?r0.non_witness_voters,
+            "r1_witness" => r1.witness,
+            "r1_excluded" => r1.excluded,
         );
         true
     }
@@ -1415,6 +1512,16 @@ impl<T: Storage> Raft<T> {
     /// Notifies that these raft logs have been persisted.
     pub fn on_persist_entries(&mut self, index: u64, term: u64) {
         let update = self.raft_log.maybe_persist(index, term);
+        info!(
+            self.logger,
+            "on_persist_entries";
+            "index" => index,
+            "term" => term,
+            "update" => update,
+            "state" => ?self.state,
+            "persisted" => self.raft_log.persisted,
+            "committed" => self.raft_log.committed,
+        );
         if update && self.state == StateRole::Leader {
             // Actually, if it is a leader and persisted index is updated, this term
             // must be equal to self.term because the persisted index must be equal to

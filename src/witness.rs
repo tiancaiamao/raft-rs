@@ -224,23 +224,21 @@ impl Witness {
         }
 
         // Per the paper (Fig 2.7, HandleRequestWitnessVoteRequest):
-        // Condition 1: m.mvotesGranted ⊆ witnessReplicationSet
-        //   All votes the candidate claims must be from servers within the
-        //   witness's current replication set. This prevents a stale candidate
-        //   from winning the witness's vote after the replication set has been
-        //   adjusted by the current leader.
+        //   grant = ∧ m.mterm = currentTerm[WitnessID]
+        //           ∧ logOk
+        //           ∧ votedFor[WitnessID] ∈ {Nil, j}
         //
-        // Condition 2: votedFor[WitnessID] ∈ {Nil, j}
-        //   The witness must not have already voted for a different candidate
-        //   in this term.
-        //
-        // Both conditions must hold regardless of the log comparison outcome.
+        // logOk is a three-way disjunction (see below). The replication-set
+        // membership check (mvotesGranted ⊆ witnessReplicationSet) appears
+        // ONLY in logOk's third branch (equal term and equal subterm), NOT as
+        // a standalone global condition.
 
-        // Condition 1: all voters that have granted the candidate are in our replication set.
+        // Compute whether all voters that granted the candidate are within our
+        // replication set. This is needed for logOk's third branch only.
         // Skip this check if the replication set is empty (uninitialized witness).
         // This can happen when a witness is freshly created via ConfChange and hasn't
         // yet received its first heartbeat/append from the leader. In this state, there
-        // is no quorum defined yet, so condition 1 is not applicable.
+        // is no quorum defined yet, so the check is not applicable.
         let replication_set_ok = if !self.replication_set.is_empty() {
             msg.vote_ids
                 .iter()
@@ -280,19 +278,29 @@ impl Witness {
         // votes, and those regular voters applied the full Raft log-up-to-date
         // check (including index). The witness only breaks the tie.
         //
-        // For the equal-(term, subterm) case the paper additionally requires
-        // `mvotesGranted ⊆ witnessReplicationSet`; that is enforced by the
-        // separate `replication_set_ok` check below, which is applied to all
-        // branches (strictly more restrictive than the paper — safe).
+        // The replication-set check (mvotesGranted ⊆ witnessReplicationSet) is
+        // required ONLY in the equal-(term, subterm) branch. A candidate with
+        // a strictly greater term or subterm has already proven its log is more
+        // up-to-date, so replication-set membership is irrelevant for those
+        // branches.
         let log_ok = if msg.last_log_term > self.last_log_term {
+            // Branch 1: mlastLogTerm > witnessLastLogTerm
             true
         } else if msg.last_log_term == self.last_log_term {
-            msg.last_log_subterm >= self.last_log_subterm
+            if msg.last_log_subterm > self.last_log_subterm {
+                // Branch 2: term = ∧ subterm > witnessLastLogSubterm
+                true
+            } else {
+                // Branch 3: term = ∧ subterm ≤
+                //   logOk only when subterm = AND mvotesGranted ⊆ set.
+                msg.last_log_subterm == self.last_log_subterm && replication_set_ok
+            }
         } else {
+            // term < witnessLastLogTerm
             false
         };
 
-        // Condition 2: votedFor[WitnessID] ∈ {Nil, j}
+        // votedFor[WitnessID] ∈ {Nil, j}
         //   The witness must not have already voted for a different candidate
         //   in this term. However, a request at a higher term from a different
         //   candidate is always allowed — it means the current leader may have
@@ -312,7 +320,7 @@ impl Witness {
         //     a liveness failure.
         let can_vote = msg.term > self.term || self.vote == 0 || self.vote == msg.from;
 
-        let grant = log_ok && replication_set_ok && can_vote;
+        let grant = log_ok && can_vote;
 
         #[cfg(feature = "witness-debug")]
         println!(
