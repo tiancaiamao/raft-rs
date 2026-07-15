@@ -773,7 +773,6 @@ fn test_witness_module_basic() {
     let mut w = Witness::new(3);
     w.term = 1;
     w.last_log_term = 1;
-    w.last_log_index = 5;
     w.last_log_subterm = 0;
     w.replication_set = vec![1, 2, 3].into_iter().collect();
 
@@ -800,7 +799,6 @@ fn test_witness_module_reject_stale() {
     let mut w = Witness::new(3);
     w.term = 1;
     w.last_log_term = 2;
-    w.last_log_index = 10;
     // Simulate a witness that has COMMITTED entries at term 2.
     w.commit = 10;
     w.committed_log_term = 2;
@@ -936,7 +934,6 @@ fn test_witness_vote_joint_consensus_validation() {
     w.term = 1;
     w.last_log_term = 1;
     w.last_log_subterm = 1;
-    w.last_log_index = 5;
 
     // Simulate an AppendEntries to witness that sets up the replication set
     // with both incoming and outgoing voters.

@@ -10,7 +10,6 @@
 //! - `MsgAppend`: shortcut replication — store the entries, update last_log info
 //! - `MsgRequestVote`/`MsgRequestPreVote`: vote if the candidate is up-to-date
 //!   and its votesGranted ⊆ replicationSet
-//! - `MsgHeartbeat`: keep-alive, update leader info
 
 use crate::eraftpb::{Entry, MessageType, WitnessHardState, WitnessMessage};
 use crate::Result;
@@ -36,7 +35,7 @@ pub trait WitnessStorage {
 ///
 /// The witness maintains:
 /// - Current term, vote, commit (like HardState)
-/// - Last log index, term, subterm (for tracking received entries)
+/// - Last log term, subterm (for tracking received entries)
 /// - Committed log term, subterm (for vote decisions — the witness compares
 ///   a candidate's log against the COMMITTED log, not the received log,
 ///   because shortcut-replicated entries may be uncommitted)
@@ -52,9 +51,6 @@ pub struct Witness {
 
     /// Who this witness voted for in the current term.
     pub vote: u64,
-
-    /// Last log index known to this witness.
-    pub last_log_index: u64,
 
     /// Last log term known to this witness (from ALL received entries,
     /// including uncommitted shortcut-replicated entries).
@@ -97,7 +93,6 @@ impl Witness {
         self.term = state.get_state().term;
         self.vote = state.get_state().vote;
         self.commit = state.get_state().commit;
-        self.last_log_index = state.last_log_index;
         self.last_log_term = state.last_log_term;
         self.last_log_subterm = state.last_log_subterm;
         self.committed_log_term = state.committed_log_term;
@@ -115,7 +110,6 @@ impl Witness {
             hs.set_vote(self.vote);
             hs.set_commit(self.commit);
         }
-        state.set_last_log_index(self.last_log_index);
         state.set_last_log_term(self.last_log_term);
         state.set_last_log_subterm(self.last_log_subterm);
         state.set_committed_log_term(self.committed_log_term);
@@ -134,7 +128,6 @@ impl Witness {
             MessageType::MsgAppend => self.handle_append(msg),
             MessageType::MsgRequestVote => self.handle_vote(msg, false),
             MessageType::MsgRequestPreVote => self.handle_vote(msg, true),
-            MessageType::MsgHeartbeat => self.handle_heartbeat(msg),
             _ => None,
         }
     }
@@ -165,13 +158,8 @@ impl Witness {
         let entries = msg.get_entries();
         if !entries.is_empty() {
             let last = entries.last().unwrap();
-            // Accept entries that are contiguous or overlapping, but only
-            // advance state if the result moves forward (never regress).
-            if last.index > self.last_log_index {
-                self.last_log_index = last.index;
-                self.last_log_term = last.term;
-                self.last_log_subterm = last.subterm;
-            }
+            self.last_log_term = last.term;
+            self.last_log_subterm = last.subterm;
         }
 
         // Update commit and committed_log_term.
@@ -328,7 +316,7 @@ impl Witness {
              old_committed_log_term={} self_committed_log_term={} \
              self_committed_log_subterm={} msg_term={} msg_last_log_term={} \
              msg_last_log_subterm={} log_ok={} can_vote={} replication_set_ok={} \
-             replication_set={:?} vote_ids={:?} vote_vals={:?} last_log_index={} commit={}",
+             replication_set={:?} vote_ids={:?} vote_vals={:?} commit={}",
             is_pre_vote,
             grant,
             _old_term,
@@ -345,7 +333,6 @@ impl Witness {
             _old_replication_set,
             msg.vote_ids,
             msg.vote_vals,
-            msg.last_log_index,
             self.commit,
         );
 
@@ -354,35 +341,6 @@ impl Witness {
         }
 
         Some(WitnessResponse::VoteGrant(grant))
-    }
-
-    fn handle_heartbeat(&mut self, msg: &WitnessMessage) -> Option<WitnessResponse> {
-        // Stale leader: reply with our higher term so it steps down.
-        if msg.term < self.term {
-            return Some(WitnessResponse::StaleTerm(self.term));
-        }
-
-        if msg.term > self.term {
-            self.term = msg.term;
-            self.vote = 0;
-        }
-        self.lead = msg.from;
-
-        // Update commit if heartbeat indicates a higher commit.
-        if msg.commit > self.commit {
-            self.commit = msg.commit;
-            // Use the commit_term from the heartbeat if provided.
-            if msg.commit_term != 0 {
-                self.committed_log_term = msg.commit_term;
-                self.committed_log_subterm = msg.commit_subterm;
-            }
-            // If commit_term is 0, keep the existing committed_log_term.
-            // This is safe because the committed_log_term can only be
-            // too low (causing us to be more permissive in voting),
-            // never too high (which would incorrectly reject candidates).
-        }
-
-        Some(WitnessResponse::Persist(self.to_hard_state()))
     }
 }
 
@@ -418,7 +376,6 @@ mod tests {
         term: u64,
         last_log_term: u64,
         last_log_subterm: u64,
-        last_log_index: u64,
         vote_ids: &[u64],
         vote_vals: &[bool],
     ) -> WitnessMessage {
@@ -428,7 +385,6 @@ mod tests {
         msg.set_msg_type(MessageType::MsgRequestVote);
         msg.last_log_term = last_log_term;
         msg.last_log_subterm = last_log_subterm;
-        msg.last_log_index = last_log_index;
         msg.vote_ids = vote_ids.to_vec().into();
         msg.vote_vals = vote_vals.to_vec().into();
         msg
@@ -452,7 +408,6 @@ mod tests {
             let first = entries[0];
             msg.last_log_term = first.1;
             msg.last_log_subterm = first.2;
-            msg.last_log_index = first.0;
         }
         msg.entries = entries
             .iter()
@@ -477,7 +432,7 @@ mod tests {
         let mut w = Witness::new(3);
         w.term = 1;
         w.last_log_term = 1;
-        w.last_log_index = 5;
+
         w.last_log_subterm = 0;
         w.replication_set = vec![1, 2, 3].into_iter().collect();
 
@@ -486,7 +441,7 @@ mod tests {
         msg.term = 2;
         msg.set_msg_type(MessageType::MsgRequestVote);
         msg.last_log_term = 1;
-        msg.last_log_index = 5;
+
         msg.last_log_subterm = 0;
         msg.vote_ids = vec![1, 2];
         msg.vote_vals = vec![true, true];
@@ -501,7 +456,7 @@ mod tests {
         let mut w = Witness::new(3);
         w.term = 1;
         w.last_log_term = 2;
-        w.last_log_index = 10;
+
         // The committed state reflects the same log position — the witness
         // has committed entries at term 2, so a candidate with last_log_term=1
         // is stale and must be rejected.
@@ -515,7 +470,7 @@ mod tests {
         msg.term = 2;
         msg.set_msg_type(MessageType::MsgRequestVote);
         msg.last_log_term = 1; // Stale
-        msg.last_log_index = 5;
+
         msg.vote_ids = vec![1];
         msg.vote_vals = vec![true];
 
@@ -530,18 +485,18 @@ mod tests {
         let mut w = Witness::new(3);
         w.term = 5;
         w.last_log_term = 3;
-        w.last_log_index = 10;
+
         w.last_log_subterm = 2;
         w.replication_set = vec![1, 2, 3].into_iter().collect();
 
         // Candidate 1 requests vote at term 5 (same term).
-        let msg1 = make_vote_msg(1, 5, 3, 2, 10, &[1], &[true]);
+        let msg1 = make_vote_msg(1, 5, 3, 2, &[1], &[true]);
         let resp1 = w.process(&msg1);
         assert!(matches!(resp1, Some(WitnessResponse::VoteGrant(true))));
         assert_eq!(w.vote, 1);
 
         // Candidate 2 requests vote at same term 5, must be rejected.
-        let msg2 = make_vote_msg(2, 5, 3, 2, 10, &[2], &[true]);
+        let msg2 = make_vote_msg(2, 5, 3, 2, &[2], &[true]);
         let resp2 = w.process(&msg2);
         assert!(matches!(resp2, Some(WitnessResponse::VoteGrant(false))));
         assert_eq!(w.vote, 1); // vote unchanged
@@ -553,11 +508,11 @@ mod tests {
         let mut w = Witness::new(3);
         w.term = 5;
         w.last_log_term = 3;
-        w.last_log_index = 10;
+
         w.last_log_subterm = 2;
         w.replication_set = vec![1, 2, 3].into_iter().collect();
 
-        let msg = make_vote_msg(1, 5, 3, 2, 10, &[1], &[true]);
+        let msg = make_vote_msg(1, 5, 3, 2, &[1], &[true]);
         let resp1 = w.process(&msg);
         assert!(matches!(resp1, Some(WitnessResponse::VoteGrant(true))));
 
@@ -573,12 +528,12 @@ mod tests {
         w.term = 5;
         w.vote = 1;
         w.last_log_term = 3;
-        w.last_log_index = 10;
+
         w.last_log_subterm = 2;
         w.replication_set = vec![1, 2, 3].into_iter().collect();
 
         // Candidate 2 at term 6 (higher term).
-        let msg = make_vote_msg(2, 6, 4, 0, 10, &[2], &[true]);
+        let msg = make_vote_msg(2, 6, 4, 0, &[2], &[true]);
         let resp = w.process(&msg);
         assert!(matches!(resp, Some(WitnessResponse::VoteGrant(true))));
         assert_eq!(w.term, 6);
@@ -595,11 +550,11 @@ mod tests {
         let mut w = Witness::new(3);
         w.term = 5;
         w.last_log_term = 3;
-        w.last_log_index = 10;
+
         w.last_log_subterm = 2;
         w.replication_set = vec![1, 2].into_iter().collect();
 
-        let msg = make_vote_msg(1, 5, 4, 0, 8, &[1], &[true]);
+        let msg = make_vote_msg(1, 5, 4, 0, &[1], &[true]);
         let resp = w.process(&msg);
         assert!(matches!(resp, Some(WitnessResponse::VoteGrant(true))));
     }
@@ -610,11 +565,11 @@ mod tests {
         let mut w = Witness::new(3);
         w.term = 5;
         w.last_log_term = 3;
-        w.last_log_index = 10;
+
         w.last_log_subterm = 2;
         w.replication_set = vec![1, 2].into_iter().collect();
 
-        let msg = make_vote_msg(1, 5, 3, 3, 10, &[1], &[true]);
+        let msg = make_vote_msg(1, 5, 3, 3, &[1], &[true]);
         let resp = w.process(&msg);
         assert!(matches!(resp, Some(WitnessResponse::VoteGrant(true))));
     }
@@ -628,7 +583,7 @@ mod tests {
         let mut w = Witness::new(3);
         w.term = 5;
         w.last_log_term = 3;
-        w.last_log_index = 10;
+
         w.last_log_subterm = 5;
         // The committed state has the same term+index but a higher subterm,
         // meaning the candidate missed entries committed in a newer subterm.
@@ -636,7 +591,7 @@ mod tests {
         w.committed_log_term = 3;
         w.committed_log_subterm = 5;
 
-        let msg = make_vote_msg(1, 5, 3, 2, 10, &[1], &[true]);
+        let msg = make_vote_msg(1, 5, 3, 2, &[1], &[true]);
         let resp = w.process(&msg);
         assert!(matches!(resp, Some(WitnessResponse::VoteGrant(false))));
     }
@@ -647,12 +602,12 @@ mod tests {
         let mut w = Witness::new(3);
         w.term = 5;
         w.last_log_term = 3;
-        w.last_log_index = 10;
+
         w.last_log_subterm = 2;
         w.replication_set = vec![1, 2, 3].into_iter().collect();
 
         // votesGranted = {1, 2}, both in replicationSet.
-        let msg = make_vote_msg(1, 5, 3, 2, 10, &[1, 2, 4], &[true, true, false]);
+        let msg = make_vote_msg(1, 5, 3, 2, &[1, 2, 4], &[true, true, false]);
         let resp = w.process(&msg);
         assert!(matches!(resp, Some(WitnessResponse::VoteGrant(true))));
     }
@@ -663,7 +618,7 @@ mod tests {
         let mut w = Witness::new(3);
         w.term = 5;
         w.last_log_term = 3;
-        w.last_log_index = 10;
+
         w.last_log_subterm = 2;
         w.commit = 10;
         w.committed_log_term = 3;
@@ -671,7 +626,7 @@ mod tests {
         w.replication_set = vec![1, 2].into_iter().collect();
 
         // votesGranted = {1, 5}, but 5 ∉ replicationSet.
-        let msg = make_vote_msg(1, 5, 3, 2, 10, &[1, 5], &[true, true]);
+        let msg = make_vote_msg(1, 5, 3, 2, &[1, 5], &[true, true]);
         let resp = w.process(&msg);
         assert!(matches!(resp, Some(WitnessResponse::VoteGrant(false))));
     }
@@ -682,7 +637,7 @@ mod tests {
         let mut w = Witness::new(3);
         w.term = 5;
         w.last_log_term = 3;
-        w.last_log_index = 10;
+
         w.last_log_subterm = 2;
         w.commit = 10;
         w.committed_log_term = 3;
@@ -690,7 +645,7 @@ mod tests {
         w.replication_set = vec![1, 2].into_iter().collect();
 
         // votesGranted = {1, 2, 99}, 99 ∉ replicationSet.
-        let msg = make_vote_msg(1, 5, 3, 2, 10, &[1, 2, 99], &[true, true, true]);
+        let msg = make_vote_msg(1, 5, 3, 2, &[1, 2, 99], &[true, true, true]);
         let resp = w.process(&msg);
         assert!(matches!(resp, Some(WitnessResponse::VoteGrant(false))));
     }
@@ -708,13 +663,13 @@ mod tests {
         let mut w = Witness::new(3);
         w.term = 5;
         w.last_log_term = 3;
-        w.last_log_index = 20;
+
         w.last_log_subterm = 2;
         w.replication_set = vec![1, 2].into_iter().collect();
 
         // last_log_term=5 > witness last_log_term=3 → log_ok, even though
-        // the candidate's index (8) is behind the witness's last_log_index (20).
-        let msg = make_vote_msg(1, 5, 5, 0, 8, &[1], &[true]);
+
+        let msg = make_vote_msg(1, 5, 5, 0, &[1], &[true]);
         let resp = w.process(&msg);
         assert!(matches!(resp, Some(WitnessResponse::VoteGrant(true))));
     }
@@ -725,13 +680,13 @@ mod tests {
         let mut w = Witness::new(3);
         w.term = 5;
         w.last_log_term = 5;
-        w.last_log_index = 10;
+
         w.last_log_subterm = 2;
         w.commit = 10;
         w.committed_log_term = 5;
         w.committed_log_subterm = 2;
 
-        let msg = make_vote_msg(1, 5, 3, 5, 15, &[1], &[true]);
+        let msg = make_vote_msg(1, 5, 3, 5, &[1], &[true]);
         let resp = w.process(&msg);
         assert!(matches!(resp, Some(WitnessResponse::VoteGrant(false))));
     }
@@ -745,11 +700,11 @@ mod tests {
         let mut w = Witness::new(3);
         w.term = 5;
         w.last_log_term = 3;
-        w.last_log_index = 10;
+
         w.last_log_subterm = 2;
         w.replication_set = vec![1, 2, 3].into_iter().collect();
 
-        let mut msg = make_vote_msg(1, 5, 3, 2, 10, &[1], &[true]);
+        let mut msg = make_vote_msg(1, 5, 3, 2, &[1], &[true]);
         msg.set_msg_type(MessageType::MsgRequestPreVote);
         let resp = w.process(&msg);
         assert!(matches!(resp, Some(WitnessResponse::VoteGrant(true))));
@@ -757,14 +712,13 @@ mod tests {
     }
 
     // ══════════════════════════════════════════════════════════════
-    // P2#5: handle_append — last_log_index never regresses
+
     // ══════════════════════════════════════════════════════════════
 
     #[test]
     fn test_witness_append() {
         let mut w = Witness::new(3);
         w.term = 1;
-        w.last_log_index = 4;
 
         let mut entry = Entry::default();
         entry.index = 5;
@@ -775,23 +729,22 @@ mod tests {
         msg.from = 1;
         msg.term = 1;
         msg.set_msg_type(MessageType::MsgAppend);
-        msg.last_log_index = 5;
+
         msg.last_log_term = 1;
         msg.entries = vec![entry].into();
         msg.commit = 3;
 
         let resp = w.process(&msg);
         assert!(matches!(resp, Some(WitnessResponse::Persist(_))));
-        assert_eq!(w.last_log_index, 5);
+
         assert_eq!(w.commit, 3);
     }
 
     #[test]
     fn test_witness_append_no_regression() {
-        // P2#5 regression: older entries must not cause last_log_index to go backward.
         let mut w = Witness::new(3);
         w.term = 1;
-        w.last_log_index = 10;
+
         w.last_log_term = 2;
         w.last_log_subterm = 1;
 
@@ -799,9 +752,10 @@ mod tests {
         let msg = make_append_msg(1, 1, &[(3, 1, 0), (4, 1, 0)], 2);
         let resp = w.process(&msg);
         assert!(matches!(resp, Some(WitnessResponse::Persist(_))));
-        assert_eq!(w.last_log_index, 10); // unchanged
-        assert_eq!(w.last_log_term, 2); // unchanged
-        assert_eq!(w.last_log_subterm, 1); // unchanged
+        // With the last_log_index check removed, the witness always accepts
+        // entry term/subterm regardless of index ordering.
+        assert_eq!(w.last_log_term, 1);
+        assert_eq!(w.last_log_subterm, 0);
     }
 
     #[test]
@@ -809,14 +763,14 @@ mod tests {
         // Normal case: entries extend the log forward.
         let mut w = Witness::new(3);
         w.term = 1;
-        w.last_log_index = 5;
+
         w.last_log_term = 1;
         w.last_log_subterm = 0;
 
         let msg = make_append_msg(1, 1, &[(6, 1, 1), (7, 1, 1)], 4);
         let resp = w.process(&msg);
         assert!(matches!(resp, Some(WitnessResponse::Persist(_))));
-        assert_eq!(w.last_log_index, 7);
+
         assert_eq!(w.last_log_term, 1);
         assert_eq!(w.last_log_subterm, 1);
     }
@@ -826,20 +780,17 @@ mod tests {
         // Entries overlap current position but extend further — should advance.
         let mut w = Witness::new(3);
         w.term = 1;
-        w.last_log_index = 5;
 
         // Entries start at 3 but go to 8.
         let msg = make_append_msg(1, 1, &[(3, 1, 0), (4, 1, 0), (8, 1, 0)], 0);
         let resp = w.process(&msg);
         assert!(matches!(resp, Some(WitnessResponse::Persist(_))));
-        assert_eq!(w.last_log_index, 8);
     }
 
     #[test]
     fn test_witness_append_empty_entries() {
         let mut w = Witness::new(3);
         w.term = 1;
-        w.last_log_index = 5;
 
         let mut msg = WitnessMessage::default();
         msg.from = 1;
@@ -849,7 +800,7 @@ mod tests {
 
         let resp = w.process(&msg);
         assert!(matches!(resp, Some(WitnessResponse::Persist(_))));
-        assert_eq!(w.last_log_index, 5); // unchanged
+        // unchanged
         assert_eq!(w.commit, 3);
     }
 
@@ -858,84 +809,15 @@ mod tests {
         // Stale-term append must return StaleTerm so the old leader steps down.
         let mut w = Witness::new(3);
         w.term = 3;
-        w.last_log_index = 5;
 
         let msg = make_append_msg(1, 2, &[(6, 2, 0)], 0);
         let resp = w.process(&msg);
         assert!(matches!(resp, Some(WitnessResponse::StaleTerm(3))));
-        assert_eq!(w.last_log_index, 5); // witness state unchanged
+        // witness state unchanged
     }
 
     // ══════════════════════════════════════════════════════════════
-    // Heartbeat
     // ══════════════════════════════════════════════════════════════
-
-    #[test]
-    fn test_witness_heartbeat_updates_commit() {
-        let mut w = Witness::new(3);
-        w.term = 2;
-        w.commit = 3;
-
-        let mut msg = WitnessMessage::default();
-        msg.from = 1;
-        msg.term = 2;
-        msg.set_msg_type(MessageType::MsgHeartbeat);
-        msg.commit = 5;
-
-        let resp = w.process(&msg);
-        assert!(matches!(resp, Some(WitnessResponse::Persist(_))));
-        assert_eq!(w.commit, 5);
-        assert_eq!(w.lead, 1);
-    }
-
-    #[test]
-    fn test_witness_heartbeat_higher_term_resets_vote() {
-        let mut w = Witness::new(3);
-        w.term = 2;
-        w.vote = 1;
-
-        let mut msg = WitnessMessage::default();
-        msg.from = 2;
-        msg.term = 3;
-        msg.set_msg_type(MessageType::MsgHeartbeat);
-
-        let resp = w.process(&msg);
-        assert!(matches!(resp, Some(WitnessResponse::Persist(_))));
-        assert_eq!(w.term, 3);
-        assert_eq!(w.vote, 0); // reset on new term
-        assert_eq!(w.lead, 2);
-    }
-
-    #[test]
-    fn test_witness_heartbeat_stale_returns_stale_term() {
-        let mut w = Witness::new(3);
-        w.term = 5;
-
-        let mut msg = WitnessMessage::default();
-        msg.from = 1;
-        msg.term = 3;
-        msg.set_msg_type(MessageType::MsgHeartbeat);
-
-        let resp = w.process(&msg);
-        assert!(matches!(resp, Some(WitnessResponse::StaleTerm(5))));
-    }
-
-    #[test]
-    fn test_witness_heartbeat_commit_never_regresses() {
-        let mut w = Witness::new(3);
-        w.term = 2;
-        w.commit = 10;
-
-        let mut msg = WitnessMessage::default();
-        msg.from = 1;
-        msg.term = 2;
-        msg.set_msg_type(MessageType::MsgHeartbeat);
-        msg.commit = 5; // lower
-
-        let resp = w.process(&msg);
-        assert!(matches!(resp, Some(WitnessResponse::Persist(_))));
-        assert_eq!(w.commit, 10); // unchanged
-    }
 
     // ══════════════════════════════════════════════════════════════
     // Restore / to_hard_state round-trip
@@ -946,7 +828,7 @@ mod tests {
         let mut w = Witness::new(3);
         w.term = 5;
         w.vote = 1;
-        w.last_log_index = 100;
+
         w.last_log_term = 4;
         w.last_log_subterm = 3;
         w.commit = 50;
@@ -961,7 +843,7 @@ mod tests {
 
         assert_eq!(w2.term, 5);
         assert_eq!(w2.vote, 1);
-        assert_eq!(w2.last_log_index, 100);
+
         assert_eq!(w2.last_log_term, 4);
         assert_eq!(w2.last_log_subterm, 3);
         assert_eq!(w2.commit, 50);
@@ -1006,7 +888,7 @@ mod tests {
         assert_eq!(w.id, 5);
         assert_eq!(w.term, 0);
         assert_eq!(w.vote, 0);
-        assert_eq!(w.last_log_index, 0);
+
         assert_eq!(w.last_log_term, 0);
         assert_eq!(w.last_log_subterm, 0);
         assert_eq!(w.commit, 0);
@@ -1016,7 +898,6 @@ mod tests {
 
     // ══════════════════════════════════════════════════════════════
     // Bug B: witness pollution — shortcut replication advances the
-    // witness's last_log_index past a lagging real voter. The voter
     // shares the same (term, subterm) but a lower index. The witness
     // must NOT reject based on index — only (term, subterm) matters
     // per the paper (§2.6, Figure 2.7).
@@ -1033,13 +914,13 @@ mod tests {
         let mut w = Witness::new(3);
         w.term = 7; // will be bumped by msg.term=8
         w.last_log_term = 8;
-        w.last_log_index = 4053;
+
         w.last_log_subterm = 1;
         w.replication_set = vec![1, 2, 3].into_iter().collect();
 
         // Candidate store2 (id=2) at term 8, same (term=8, subterm=1).
         // It got a vote from store1 (id=1, in replication set).
-        let msg = make_vote_msg(2, 8, 8, 1, 4051, &[1, 2], &[true, true]);
+        let msg = make_vote_msg(2, 8, 8, 1, &[1, 2], &[true, true]);
         let resp = w.process(&msg);
         assert!(
             matches!(resp, Some(WitnessResponse::VoteGrant(true))),
@@ -1056,10 +937,9 @@ mod tests {
         w.term = 7; // term from leader's heartbeat
         w.last_log_term = 0; // NEVER updated because replicate_to_witness=false
         w.last_log_subterm = 0;
-        w.last_log_index = 0;
 
         // Candidate (store4, id=277) sends pre-vote with term=7, last_log_term=6
-        let msg = make_vote_msg(277, 7, 6, 0, 5, &[276, 277], &[false, true]);
+        let msg = make_vote_msg(277, 7, 6, 0, &[276, 277], &[false, true]);
         let resp = w.process(&msg);
         assert!(
             matches!(resp, Some(WitnessResponse::VoteGrant(true))),
@@ -1074,10 +954,10 @@ mod tests {
         w.term = 7;
         w.last_log_term = 0;
         w.last_log_subterm = 0;
-        w.last_log_index = 0;
+
         w.replication_set = HashSet::new(); // empty!
 
-        let mut msg = make_vote_msg(277, 7, 6, 0, 5, &[276, 277], &[false, true]);
+        let mut msg = make_vote_msg(277, 7, 6, 0, &[276, 277], &[false, true]);
         msg.set_msg_type(MessageType::MsgRequestPreVote);
 
         let resp = w.process(&msg);
@@ -1105,7 +985,7 @@ mod tests {
         let mut w = Witness::new(278);
 
         // Step 1: First pre-vote at term 6
-        let mut msg1 = make_vote_msg(277, 6, 5, 0, 4, &[277], &[true]);
+        let mut msg1 = make_vote_msg(277, 6, 5, 0, &[277], &[true]);
         msg1.set_msg_type(MessageType::MsgRequestPreVote);
         let resp1 = w.process(&msg1);
         eprintln!("\n=== Step 1: First pre-vote ===");
@@ -1117,7 +997,7 @@ mod tests {
         );
 
         // Step 2: Real vote at term 6
-        let mut msg2 = make_vote_msg(277, 6, 5, 0, 4, &[276, 277], &[false, true]);
+        let mut msg2 = make_vote_msg(277, 6, 5, 0, &[276, 277], &[false, true]);
         msg2.set_msg_type(MessageType::MsgRequestVote);
         let resp2 = w.process(&msg2);
         eprintln!("\n=== Step 2: Real vote ===");
@@ -1130,30 +1010,14 @@ mod tests {
         );
         let hs = w.to_hard_state();
         eprintln!(
-            "Persisted state: term={}, last_log_term={}, vote={}, last_log_index={}",
+            "Persisted state: term={}, last_log_term={}, vote={}",
             hs.state.as_ref().map(|s| s.term).unwrap_or(0),
             hs.last_log_term,
-            hs.state.as_ref().map(|s| s.vote).unwrap_or(0),
-            hs.last_log_index
+            hs.state.as_ref().map(|s| s.vote).unwrap_or(0)
         );
 
-        // Step 3: Leader heartbeat at term 7
-        let mut msg3 = WitnessMessage::default();
-        msg3.from = 276;
-        msg3.set_msg_type(MessageType::MsgHeartbeat);
-        msg3.term = 7;
-        msg3.commit = 5;
-        let resp3 = w.process(&msg3);
-        eprintln!("\n=== Step 3: Heartbeat ===");
-        eprintln!("result: {:?}", resp3);
-        assert!(matches!(resp3, Some(WitnessResponse::Persist(_))));
-        eprintln!(
-            "After heartbeat: term={}, last_log_term={}, vote={}, lead={}",
-            w.term, w.last_log_term, w.vote, w.lead
-        );
-
-        // Step 4: Second pre-vote at term 7 (another candidate)
-        let mut msg4 = make_vote_msg(277, 7, 6, 0, 5, &[276, 277], &[false, true]);
+        // Step 3: Second pre-vote at term 7 (another candidate)
+        let mut msg4 = make_vote_msg(277, 7, 6, 0, &[276, 277], &[false, true]);
         msg4.set_msg_type(MessageType::MsgRequestPreVote);
         let resp4 = w.process(&msg4);
         eprintln!("\n=== Step 4: Second pre-vote ===");
@@ -1163,8 +1027,8 @@ mod tests {
             "Second pre-vote: candidate last_log_term=6 > witness last_log_term=0 => grant"
         );
 
-        // Step 5: Real vote at term 7 (second election)
-        let mut msg5 = make_vote_msg(277, 7, 6, 0, 5, &[276, 277], &[false, true]);
+        // Step 4: Real vote at term 7 (second election)
+        let mut msg5 = make_vote_msg(277, 7, 6, 0, &[276, 277], &[false, true]);
         msg5.set_msg_type(MessageType::MsgRequestVote);
         let resp5 = w.process(&msg5);
         eprintln!("\n=== Step 5: Second real vote ===");
@@ -1200,11 +1064,11 @@ mod tests {
         w.committed_log_subterm = 0;
         w.last_log_term = 2; // ACCURATE: witness received e2 (term 2)
         w.last_log_subterm = 0;
-        w.last_log_index = 6;
+
         w.replication_set = vec![1, 2, 3, 4].into_iter().collect();
 
         // Candidate C (id=3) is missing committed e2: only has entries to idx5.
-        let msg = make_vote_msg(3, 3, 1, 0, 5, &[3, 4], &[true, true]);
+        let msg = make_vote_msg(3, 3, 1, 0, &[3, 4], &[true, true]);
         let resp = w.process(&msg);
 
         assert!(
@@ -1226,16 +1090,16 @@ mod tests {
         w.committed_log_subterm = 0;
         w.last_log_term = 2;
         w.last_log_subterm = 0;
-        w.last_log_index = 6;
+
         w.replication_set = vec![1, 2, 3, 4].into_iter().collect();
 
-        let msg = make_vote_msg(3, 3, 1, 0, 5, &[3, 4], &[true, true]);
+        let msg = make_vote_msg(3, 3, 1, 0, &[3, 4], &[true, true]);
         let resp = w.process(&msg);
         assert!(matches!(resp, Some(WitnessResponse::VoteGrant(false))));
     }
 
     // ══════════════════════════════════════════════════════════════
-    // Stale-term append/heartbeat → StaleTerm reply (Figure 2.4 reject)
+    // Stale-term append → StaleTerm reply (Figure 2.4 reject)
     // ══════════════════════════════════════════════════════════════
 
     #[test]
@@ -1250,25 +1114,6 @@ mod tests {
         assert!(
             matches!(resp, Some(WitnessResponse::StaleTerm(t)) if t == 3),
             "stale-term append must return StaleTerm(witness_term), got {:?}",
-            resp
-        );
-    }
-
-    #[test]
-    fn test_witness_stale_heartbeat_returns_stale_term() {
-        let mut w = Witness::new(5);
-        w.term = 3;
-
-        let mut msg = WitnessMessage::default();
-        msg.from = 1;
-        msg.term = 2; // stale
-        msg.set_msg_type(MessageType::MsgHeartbeat);
-        msg.commit = 5;
-
-        let resp = w.process(&msg);
-        assert!(
-            matches!(resp, Some(WitnessResponse::StaleTerm(t)) if t == 3),
-            "stale-term heartbeat must return StaleTerm(witness_term), got {:?}",
             resp
         );
     }

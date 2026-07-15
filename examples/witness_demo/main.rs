@@ -187,29 +187,15 @@ impl Cluster {
             WitnessResponse::Persist(state) => {
                 let term = state.get_state().term;
                 let commit = state.get_state().commit;
-                match orig.get_msg_type() {
-                    MessageType::MsgAppend => {
-                        self.witness_append_count += 1;
-                        let mut m = Message::default();
-                        m.set_msg_type(MessageType::MsgAppendResponse);
-                        m.from = self.witness_id;
-                        m.to = orig.from;
-                        m.term = term;
-                        m.index = state.last_log_index;
-                        m.commit = commit;
-                        self.pending_msgs.push(m);
-                    }
-                    MessageType::MsgHeartbeat => {
-                        self.witness_heartbeat_count += 1;
-                        let mut m = Message::default();
-                        m.set_msg_type(MessageType::MsgHeartbeatResponse);
-                        m.from = self.witness_id;
-                        m.to = orig.from;
-                        m.term = term;
-                        m.commit = commit;
-                        self.pending_msgs.push(m);
-                    }
-                    _ => {}
+                if orig.get_msg_type() == MessageType::MsgAppend {
+                    self.witness_append_count += 1;
+                    let mut m = Message::default();
+                    m.set_msg_type(MessageType::MsgAppendResponse);
+                    m.from = self.witness_id;
+                    m.to = orig.from;
+                    m.term = term;
+                    m.commit = commit;
+                    self.pending_msgs.push(m);
                 }
             }
             WitnessResponse::VoteGrant(granted) => {
@@ -534,8 +520,8 @@ fn main() {
     // ── Summary ───────────────────────────────────────────────────────
     println!("\n═══════════════════════════════════════════════════════════════");
     println!(
-        "  Witness final state: term={} index={} commit={}",
-        cluster.witness.term, cluster.witness.last_log_index, cluster.witness.commit
+        "  Witness final state: term={} commit={}",
+        cluster.witness.term, cluster.witness.commit
     );
     println!("  Done!");
 }

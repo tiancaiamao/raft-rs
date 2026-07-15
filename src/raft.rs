@@ -1044,13 +1044,7 @@ impl<T: Storage> Raft<T> {
         let r0 = &epoch.replication_sets[0];
         let r1 = &epoch.replication_sets[1];
         msg.replication_set_incoming = r0.non_witness_voters.iter().copied().collect();
-        if r0.excluded != r0.witness && r0.excluded != 0 {
-            msg.replication_set_incoming.push(r0.excluded);
-        }
         msg.replication_set_outgoing = r1.non_witness_voters.iter().copied().collect();
-        if r1.excluded != r1.witness && r1.excluded != 0 {
-            msg.replication_set_outgoing.push(r1.excluded);
-        }
 
         msg.entries = entries.into();
 
@@ -1081,37 +1075,6 @@ impl<T: Storage> Raft<T> {
         true
     }
 
-    /// Sends a lightweight heartbeat (term check) to a witness.
-    /// Used during MsgCheckQuorum to verify the witness hasn't advanced to a
-    /// higher term (which would mean a new leader was elected during a partition).
-    /// If the witness has a higher term, `witness.process()` returns `None`,
-    /// and the CSE layer steps the leader down.
-    fn send_heartbeat_to_witness(&mut self, witness_id: u64) {
-        let mut msg = WitnessMessage::default();
-        msg.from = self.id;
-        msg.to = witness_id;
-        msg.set_msg_type(MessageType::MsgHeartbeat);
-        msg.term = self.term;
-        msg.commit = self.raft_log.committed;
-        let (_, commit_term) = self.raft_log.commit_info();
-        msg.commit_term = commit_term;
-        msg.commit_subterm = self.prs().epoch.subterm;
-
-        let epoch = &self.prs.epoch;
-        let r0 = &epoch.replication_sets[0];
-        let r1 = &epoch.replication_sets[1];
-        msg.replication_set_incoming = r0.non_witness_voters.iter().copied().collect();
-        if r0.excluded != r0.witness && r0.excluded != 0 {
-            msg.replication_set_incoming.push(r0.excluded);
-        }
-        msg.replication_set_outgoing = r1.non_witness_voters.iter().copied().collect();
-        if r1.excluded != r1.witness && r1.excluded != 0 {
-            msg.replication_set_outgoing.push(r1.excluded);
-        }
-
-        self.witness_msgs.push(msg);
-    }
-
     /// Sends a RequestVote to a witness (Extended Raft).
     /// Called when a candidate has q-1 regular votes and needs the witness to break the tie.
     fn send_request_vote_to_witness(
@@ -1139,7 +1102,6 @@ impl<T: Storage> Raft<T> {
         msg.term = term;
         msg.last_log_term = last_term;
         msg.last_log_subterm = last_subterm;
-        msg.last_log_index = last_index;
 
         // Include commit info so the witness can use committed_log_term
         // for vote comparison.
@@ -1251,12 +1213,11 @@ impl<T: Storage> Raft<T> {
             return true;
         }
 
-                // Diagnostic: log when a leader with witnesses cannot commit.
+        // Diagnostic: log when a leader with witnesses cannot commit.
         // This is the key signal for partition-recovery write stalls.
         // Only log when there are actually pending entries (mci > committed);
         // otherwise the leader is simply idle and the message is noise.
-        if self.state == StateRole::Leader && self.has_witness() && mci > self.raft_log.committed
-        {
+        if self.state == StateRole::Leader && self.has_witness() && mci > self.raft_log.committed {
             let peer_states: Vec<(u64, u64, bool)> = self
                 .prs()
                 .progress()
@@ -2535,42 +2496,6 @@ impl<T: Storage> Raft<T> {
                 let mut adjusted = false;
                 if self.has_witness() {
                     adjusted = self.maybe_start_new_subterm(false, false);
-
-                    // Periodically send a heartbeat to each witness to detect
-                    // term advancement. During a network partition, a new leader
-                    // may be elected at a higher term. Shortcut replication
-                    // prevents the old leader from discovering this (it
-                    // synthesizes witness acks locally). This heartbeat forces
-                    // a real witness I/O every election timeout so the old
-                    // leader can detect the higher term and step down.
-                    //
-                    // However, we skip the heartbeat if an append CAS is
-                    // already in flight (witness_pending_subterm != 0).
-                    // Sending a heartbeat during an in-flight append creates
-                    // a CAS race: the heartbeat's CAS changes the storage
-                    // version, causing the append's CAS to fail, which
-                    // prevents shortcut replication from ever activating
-                    // and blocks commit indefinitely.
-                    let witnesses = [
-                        self.prs().conf().witnesses[0],
-                        self.prs().conf().witnesses[1],
-                    ];
-                    for wid in witnesses {
-                        if wid != 0 {
-                            let half = self.witness_config_half(wid);
-                            let append_in_flight = half
-                                .is_some_and(|h| self.prs().epoch.witness_pending_subterm[h] != 0);
-                            if append_in_flight {
-                                debug!(
-                                    self.logger,
-                                    "skipping witness heartbeat: append CAS in flight";
-                                    "witness_id" => wid,
-                                );
-                            } else {
-                                self.send_heartbeat_to_witness(wid);
-                            }
-                        }
-                    }
                 }
                 // In degraded mode the witness is in the replication set to
                 // replace an unreachable regular voter. check_quorum_active()
