@@ -974,7 +974,14 @@ impl<T: Storage> Raft<T> {
 
     /// Called when q-1 voters in the replication set have acknowledged entries
     /// up to `index`. The witness receives entries at most once per subterm.
-    fn send_append_to_witness(&mut self, witness_id: u64, _index: u64) -> bool {
+    fn send_append_to_witness(&mut self, witness_id: u64, _index: u64, half: usize) -> bool {
+        // Increment request sequence number for gRPC response ordering protection.
+        let request_seq = {
+            let next = self.prs.epoch.witness_pending_req_seq[half] + 1;
+            self.prs.epoch.witness_pending_req_seq[half] = next;
+            next
+        };
+
         let epoch = &self.prs.epoch;
 
         // Send entries starting from the witness's match index + 1,
@@ -1061,6 +1068,8 @@ impl<T: Storage> Raft<T> {
         // the witness updates committed_log_subterm, which is compared in
         // handle_vote to reject partitioned followers with stale subterms.
         msg.commit_subterm = self.prs().epoch.subterm;
+        // Attach request sequence number for gRPC response ordering.
+        msg.request_seq = request_seq;
 
         self.witness_msgs.push(msg);
         info!(
@@ -1193,7 +1202,7 @@ impl<T: Storage> Raft<T> {
                         // write succeeded (see confirm_witness_append). This
                         // ensures shortcut replication never activates on a
                         // stale leader whose witness state was overwritten.
-                        let sent = self.send_append_to_witness(*witness_id, *idx);
+                        let sent = self.send_append_to_witness(*witness_id, *idx, half);
                         if sent {
                             self.mut_prs().epoch.witness_pending_subterm[half] = current_subterm;
                         }
@@ -1249,7 +1258,7 @@ impl<T: Storage> Raft<T> {
     ///
     /// Must be called by the host application (CSE) after a successful `cas_save`
     /// for a `WitnessMessage(MsgAppend)`.
-    pub fn confirm_witness_append(&mut self, witness_id: u64) {
+    pub fn confirm_witness_append(&mut self, witness_id: u64, req_seq: u64) {
         if let Some(half) = self.witness_config_half(witness_id) {
             let current_subterm = self.prs().epoch.subterm;
             // Guard against stale confirmations: the pending subterm must
@@ -1260,10 +1269,23 @@ impl<T: Storage> Raft<T> {
             if self.prs().epoch.witness_pending_subterm[half] != current_subterm {
                 info!(
                     self.logger,
-                    "confirm_witness_append: stale, ignoring";
+                    "confirm_witness_append: stale (subterm), ignoring";
                     "witness_id" => witness_id,
                     "pending_subterm" => self.prs().epoch.witness_pending_subterm[half],
                     "current_subterm" => current_subterm,
+                );
+                return;
+            }
+            // Guard against out-of-order gRPC responses: the request sequence
+            // number must match the current pending value. If a newer request
+            // was sent (higher req_seq), this response is from a stale one.
+            if self.prs().epoch.witness_pending_req_seq[half] != req_seq {
+                info!(
+                    self.logger,
+                    "confirm_witness_append: stale (req_seq), ignoring";
+                    "witness_id" => witness_id,
+                    "pending_req_seq" => self.prs().epoch.witness_pending_req_seq[half],
+                    "req_seq" => req_seq,
                 );
                 return;
             }
@@ -1296,17 +1318,28 @@ impl<T: Storage> Raft<T> {
     /// On CAS mismatch the retry will likely fail again (another leader holds
     /// a newer subterm), but this is harmless — the leader will be deposed by
     /// election timeout. On transient errors the retry provides recovery.
-    pub fn reject_witness_append(&mut self, witness_id: u64) {
+    pub fn reject_witness_append(&mut self, witness_id: u64, req_seq: u64) {
         if let Some(half) = self.witness_config_half(witness_id) {
             let current_subterm = self.prs().epoch.subterm;
             // Guard against stale rejections, same rationale as confirm.
             if self.prs().epoch.witness_pending_subterm[half] != current_subterm {
                 info!(
                     self.logger,
-                    "reject_witness_append: stale, ignoring";
+                    "reject_witness_append: stale (subterm), ignoring";
                     "witness_id" => witness_id,
                     "pending_subterm" => self.prs().epoch.witness_pending_subterm[half],
                     "current_subterm" => current_subterm,
+                );
+                return;
+            }
+            // Guard against out-of-order gRPC responses.
+            if self.prs().epoch.witness_pending_req_seq[half] != req_seq {
+                info!(
+                    self.logger,
+                    "reject_witness_append: stale (req_seq), ignoring";
+                    "witness_id" => witness_id,
+                    "pending_req_seq" => self.prs().epoch.witness_pending_req_seq[half],
+                    "req_seq" => req_seq,
                 );
                 return;
             }

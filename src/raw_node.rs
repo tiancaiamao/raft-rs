@@ -439,14 +439,14 @@ impl<T: Storage> RawNode<T> {
 
     /// Confirms that a witness append was successfully persisted (CAS succeeded).
     /// See [`Raft::confirm_witness_append`].
-    pub fn confirm_witness_append(&mut self, witness_id: u64) {
-        self.raft.confirm_witness_append(witness_id);
+    pub fn confirm_witness_append(&mut self, witness_id: u64, req_seq: u64) {
+        self.raft.confirm_witness_append(witness_id, req_seq);
     }
 
     /// Notifies that a witness append failed (CAS mismatch or error).
     /// See [`Raft::reject_witness_append`].
-    pub fn reject_witness_append(&mut self, witness_id: u64) {
-        self.raft.reject_witness_append(witness_id);
+    pub fn reject_witness_append(&mut self, witness_id: u64, req_seq: u64) {
+        self.raft.reject_witness_append(witness_id, req_seq);
     }
 
     /// A callback when entries are fetched asynchronously.

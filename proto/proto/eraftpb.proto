@@ -253,4 +253,10 @@ message WitnessMessage {
     // entries from uncommitted shortcut-replicated entries when voting.
     uint64 commit_term = 15;
     uint64 commit_subterm = 16;
+    // request_seq is a monotonic counter per config half, used for gRPC
+    // response ordering protection. Each send_append_to_witness increments
+    // this counter and sets it on the outgoing message. The CSE layer
+    // passes it back in confirm/reject calls to ensure stale responses
+    // (due to gRPC retries or reordering) are ignored.
+    uint64 request_seq = 17;
 }

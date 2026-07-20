@@ -586,6 +586,14 @@ pub struct Epoch {
     /// confirmation from a prior subterm from activating shortcut replication
     /// in the current subterm.
     pub witness_pending_subterm: [u64; 2],
+    /// Monotonically increasing request sequence number per config half.
+    /// Each call to `send_append_to_witness` increments this counter, and
+    /// the value is placed on the outgoing `WitnessMessage.request_seq`.
+    /// The CSE layer returns this value in `confirm_witness_append` /
+    /// `reject_witness_append` calls to guard against out-of-order gRPC
+    /// responses: a response is only accepted if its `req_seq` matches the
+    /// current pending value.
+    pub witness_pending_req_seq: [u64; 2],
 }
 
 impl Epoch {
@@ -777,11 +785,13 @@ impl ProgressTracker {
                 pr.recent_active = true;
                 active.insert(*id);
             } else if pr.is_witness {
-                // Extended Raft: witness is a logical entity backed by etcd.
-                // It is always considered active — its liveness does not depend
-                // on network heartbeats like physical peers.
-                pr.recent_active = true;
-                active.insert(*id);
+                // Extended Raft: witness recent_active is set externally by
+                // the CSE layer based on gRPC response success/failure.
+                // Do not hardcode it to true — treat it like any other peer.
+                if pr.recent_active {
+                    active.insert(*id);
+                }
+                pr.recent_active = false;
             } else if pr.recent_active {
                 // It doesn't matter whether it's learner. As we calculate quorum
                 // by actual ids instead of count.
@@ -1016,6 +1026,30 @@ impl ProgressTracker {
                             changed = true;
                             break;
                         }
+                    }
+                }
+            }
+
+            // ──────────────────────────────────────────────
+            // Case 3: Witness unreachable — the witness is inside
+            // the replication set (degraded mode) but is not
+            // recently active. Remove it so the leader detects
+            // quorum loss and steps down to read-only.
+            // ──────────────────────────────────────────────
+            if set.witness != 0 && set.non_witness_voters.contains(&set.witness) {
+                if let Some(pr) = self.progress.get(&set.witness) {
+                    if !pr.recent_active {
+                        // Witness is in the replication set but unreachable.
+                        // Remove it, set excluded = witness.
+                        let mut new_non_witness = set.non_witness_voters.clone();
+                        new_non_witness.remove(&set.witness);
+
+                        new_epoch.replication_sets[i] = ReplicationSet {
+                            witness: set.witness,
+                            excluded: set.witness,
+                            non_witness_voters: new_non_witness,
+                        };
+                        changed = true;
                     }
                 }
             }
