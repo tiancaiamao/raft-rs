@@ -2842,7 +2842,17 @@ impl<T: Storage> Raft<T> {
                     return Ok(());
                 }
 
-                self.poll(m.from, m.get_msg_type(), !m.reject);
+                // Convert the response type back to the request type for poll().
+                // poll() uses the type to determine the vote term (pre-vote uses
+                // term+1) and to send witness vote requests. Passing the response
+                // type would cause send_request_vote_to_witness to create a
+                // WitnessMessage with an unhandled message type, which the witness
+                // silently drops (returns None → "witness processing failed").
+                let vote_type = match m.get_msg_type() {
+                    MessageType::MsgRequestPreVoteResponse => MessageType::MsgRequestPreVote,
+                    _ => MessageType::MsgRequestVote,
+                };
+                self.poll(m.from, vote_type, !m.reject);
                 self.maybe_commit_by_vote(&m);
             }
             MessageType::MsgTimeoutNow => debug!(
