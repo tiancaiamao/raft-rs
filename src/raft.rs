@@ -2512,6 +2512,12 @@ impl<T: Storage> Raft<T> {
                 return;
             }
         };
+        // Mark the peer as inactive. For regular voters, recent_active is
+        // also reset by check_quorum_active() each tick, so this is mostly
+        // redundant. For witnesses, this is the ONLY path that clears
+        // recent_active — they are exempt from the per-tick reset because
+        // they lack region-level heartbeats.
+        pr.recent_active = false;
         // During optimistic replication, if the remote becomes unreachable,
         // there is huge probability that a MsgAppend is lost.
         if pr.state == ProgressState::Replicate {
