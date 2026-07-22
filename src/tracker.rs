@@ -785,13 +785,23 @@ impl ProgressTracker {
                 pr.recent_active = true;
                 active.insert(*id);
             } else if pr.is_witness {
-                // Extended Raft: witness recent_active is set externally by
-                // the CSE layer based on gRPC response success/failure.
-                // Do not hardcode it to true — treat it like any other peer.
+                // Extended Raft: witnesses don't participate in region-level
+                // raft heartbeats. Their liveness is detected at the store
+                // layer via PD heartbeat, not at the region layer.
+                //
+                // recent_active is set to true once when the witness is
+                // contacted (first contact CAS send) or confirmed
+                // (confirm_witness_append). After that, shortcut replication
+                // assumes the witness is alive — we must NOT clear it here
+                // every tick, or change_replication_set() Case 3 will
+                // immediately evict the witness, dropping quorum from 2/3
+                // to 1/3.
+                //
+                // The CSE layer sets recent_active = false when the witness
+                // store is detected as down (via PD heartbeat).
                 if pr.recent_active {
                     active.insert(*id);
                 }
-                pr.recent_active = false;
             } else if pr.recent_active {
                 // It doesn't matter whether it's learner. As we calculate quorum
                 // by actual ids instead of count.

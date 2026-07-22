@@ -1205,6 +1205,13 @@ impl<T: Storage> Raft<T> {
                         let sent = self.send_append_to_witness(*witness_id, *idx, half);
                         if sent {
                             self.mut_prs().epoch.witness_pending_subterm[half] = current_subterm;
+                            // Mark as recently active — we just sent a
+                            // request. This covers the window between CAS
+                            // send and response, preventing Case 3 from
+                            // evicting the witness before confirm arrives.
+                            if let Some(pr) = self.mut_prs().get_mut(*witness_id) {
+                                pr.recent_active = true;
+                            }
                         }
                     }
                     // else: append already sent, awaiting CAS confirmation.
@@ -1291,6 +1298,17 @@ impl<T: Storage> Raft<T> {
             }
             self.mut_prs().epoch.witness_subterm[half] = current_subterm;
             self.mut_prs().epoch.witness_pending_subterm[half] = 0;
+
+            // Mark the witness as recently active. Witnesses don't receive
+            // heartbeats or append responses through normal raft channels,
+            // so their recent_active is never set by the usual path. Without
+            // this, check_quorum_active() always sees the witness as inactive,
+            // and change_replication_set() Case 3 wrongly removes the witness
+            // from the replication set — degrading quorum from 2/3 to 1/3 and
+            // causing the leader to step down unnecessarily.
+            if let Some(pr) = self.mut_prs().get_mut(witness_id) {
+                pr.recent_active = true;
+            }
 
             info!(
                 self.logger,
