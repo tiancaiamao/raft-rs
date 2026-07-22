@@ -2801,10 +2801,13 @@ impl<T: Storage> Raft<T> {
             }
             VoteResult::Pending => {
                 // Extended Raft: if we're close to winning (1 vote short),
-                // ask the witness to vote.
+                // ask the witness to vote. But only if we haven't already
+                // asked — otherwise a rejected witness vote would cause an
+                // infinite retry loop (each rejection leaves the result
+                // Pending if another voter hasn't responded yet).
                 let witness_ready = self.get_witness_vote_request_readiness(votes_to_win);
                 for (&witness_id, &ready) in &witness_ready {
-                    if ready {
+                    if ready && !self.mut_prs().has_voted(witness_id) {
                         // For pre-vote, use self.term + 1 (consistent with campaign
                         // which sends pre-vote to regular peers at self.term + 1).
                         // For real vote, use self.term.

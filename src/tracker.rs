@@ -742,6 +742,12 @@ impl ProgressTracker {
         self.votes.entry(id).or_insert(vote);
     }
 
+    /// Returns true if `id` has already cast a vote (granted or rejected)
+    /// in the current election.
+    pub fn has_voted(&self, id: u64) -> bool {
+        self.votes.contains_key(&id)
+    }
+
     /// TallyVotes returns the number of granted and rejected Votes, and whether the
     /// election outcome is known.
     pub fn tally_votes(&self) -> (usize, usize, VoteResult) {
