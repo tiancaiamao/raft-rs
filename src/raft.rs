@@ -1524,7 +1524,7 @@ impl<T: Storage> Raft<T> {
     /// Notifies that these raft logs have been persisted.
     pub fn on_persist_entries(&mut self, index: u64, term: u64) {
         let update = self.raft_log.maybe_persist(index, term);
-        info!(
+        debug!(
             self.logger,
             "on_persist_entries";
             "index" => index,
