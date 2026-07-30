@@ -1414,7 +1414,8 @@ fn test_request_seq_confirm_reject_respects_sequence_number() {
 }
 
 /// request_seq: stale confirm (from a prior subterm, carried via
-/// gRPC retry) is rejected even if pending_subterm matches.
+/// gRPC retry) is rejected because req_seq is carried forward across
+/// epoch resets, preventing collision with the current pending request.
 #[test]
 fn test_request_seq_stale_confirm_rejected() {
     let mut node = setup_leader_with_active_witness();
@@ -1424,10 +1425,15 @@ fn test_request_seq_stale_confirm_rejected() {
     node.raft.maybe_commit();
     assert_eq!(node.raft.prs().epoch.witness_pending_req_seq[0], 1);
 
-    // Simulate starting a new subterm (e.g., conf change) which resets
-    // pending_req_seq and pending_subterm.
+    // Simulate starting a new subterm (e.g., conf change). req_seq is
+    // carried forward (not reset to 0) to prevent stale callbacks from
+    // matching future requests.
     node.raft.maybe_start_new_subterm(false, true);
-    assert_eq!(node.raft.prs().epoch.witness_pending_req_seq[0], 0);
+    assert_eq!(
+        node.raft.prs().epoch.witness_pending_req_seq[0],
+        1,
+        "req_seq must be carried forward across epoch resets"
+    );
     assert_eq!(node.raft.prs().epoch.witness_pending_subterm[0], 0);
 
     // Now degrade again: set up replication set with witness.
@@ -1436,19 +1442,26 @@ fn test_request_seq_stale_confirm_rejected() {
     node.raft.mut_prs().get_mut(3).unwrap().recent_active = true;
     node.raft.mut_prs().change_replication_set(1);
 
-    // Second send: req_seq = 1 again (reset), subterm = new.
+    // Second send: req_seq = 2 (carried forward 1 + 1), subterm = new.
     node.raft.mut_prs().get_mut(1).unwrap().matched = node.raft.raft_log.last_index();
     node.raft.maybe_commit();
-    assert_eq!(node.raft.prs().epoch.witness_pending_req_seq[0], 1);
+    assert_eq!(node.raft.prs().epoch.witness_pending_req_seq[0], 2);
 
-    // Simulate a stale confirm with req_seq=1 arriving. It matches the
-    // current pending_req_seq, but the pending_subterm check should pass
-    // since pending_subterm was set by the latest send. Both checks pass.
+    // Stale confirm from the first subterm arrives with req_seq=1.
+    // It must be rejected: 1 != 2 (current pending).
     node.raft.confirm_witness_append(3, 1);
+    assert_ne!(
+        node.raft.prs().epoch.witness_subterm[0],
+        node.raft.prs().epoch.subterm,
+        "stale confirm from a prior subterm must not activate shortcut replication"
+    );
+
+    // Correct confirm with req_seq=2 should succeed.
+    node.raft.confirm_witness_append(3, 2);
     assert_eq!(
         node.raft.prs().epoch.witness_subterm[0],
         node.raft.prs().epoch.subterm,
-        "confirm with matching req_seq should activate shortcut replication"
+        "confirm with correct req_seq should activate shortcut replication"
     );
 }
 

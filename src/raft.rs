@@ -941,14 +941,29 @@ impl<T: Storage> Raft<T> {
                 core.send_heartbeat(*id, pr, ctx.clone(), msgs);
             });
 
-        // Extended Raft: auto-ack witness for ReadIndex (ReadOnlyOption::Safe).
-        // The witness is a logical entity (etcd-backed), so we treat it as
-        // acknowledged immediately without sending a heartbeat. Combined with
-        // the leader's own ack (inserted in add_request), this gives quorum
-        // for read-only requests in degraded mode (e.g. 2F1A with one node down).
+        // Extended Raft: auto-ack witness for ReadIndex (ReadOnlyOption::Safe),
+        // but ONLY when shortcut replication is active for this witness — i.e.
+        // the witness has confirmed the current replication set via CAS
+        // (witness_subterm[half] == current_subterm). Before CAS confirmation,
+        // the witness has not persisted the current replication set, so counting
+        // it as an ack would risk stale reads if a partitioned peer wins an
+        // election with the witness's vote.
         if let Some(ref ctx) = ctx {
-            let witnesses = self.prs.conf().witnesses;
-            for &wid in witnesses.iter().filter(|&&w| w != 0) {
+            let current_subterm = self.prs().epoch.subterm;
+            // Collect witnesses that have confirmed the current replication set
+            // via CAS (shortcut replication active). Only these can be auto-acked.
+            let eligible_witnesses: Vec<u64> = self
+                .prs()
+                .conf()
+                .witnesses
+                .iter()
+                .copied()
+                .enumerate()
+                .filter(|(_, w)| *w != 0)
+                .filter(|(h, _)| self.prs().epoch.witness_subterm[*h] == current_subterm)
+                .map(|(_, w)| w)
+                .collect();
+            for wid in eligible_witnesses {
                 let reached = match self.r.read_only.recv_ack(wid, ctx) {
                     Some(acks) => self.prs.has_quorum(acks),
                     None => false,
@@ -1047,11 +1062,19 @@ impl<T: Storage> Raft<T> {
         msg.last_log_subterm = first.subterm;
         msg.last_log_index = first.index;
 
-        // Include replication set info.
-        let r0 = &epoch.replication_sets[0];
-        let r1 = &epoch.replication_sets[1];
-        msg.replication_set_incoming = r0.non_witness_voters.iter().copied().collect();
-        msg.replication_set_outgoing = r1.non_witness_voters.iter().copied().collect();
+        // Include replication set info — only for this witness's config half.
+        // Per the paper (Figure 2.3), AppendEntriesToWitnessRequest carries a
+        // single replication set. In joint consensus, W1 (outgoing) must only
+        // see the old config's replication set, and W2 (incoming) must only
+        // see the new config's. Sending both would cause the witness to
+        // persist the union, breaking the isolation required for correct
+        // witness voting (Figure 2.7: mvotesGranted ⊆ witnessReplicationSet).
+        let set = &epoch.replication_sets[half];
+        if half == 0 {
+            msg.replication_set_incoming = set.non_witness_voters.iter().copied().collect();
+        } else {
+            msg.replication_set_outgoing = set.non_witness_voters.iter().copied().collect();
+        }
 
         msg.entries = entries.into();
 

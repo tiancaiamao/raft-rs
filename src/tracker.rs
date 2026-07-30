@@ -860,7 +860,16 @@ impl ProgressTracker {
     /// Called when a new leader is elected (reset_subterm=true) or when
     /// a conf change is applied (reset_subterm=false, increment subterm).
     pub fn reset_replication_set(&mut self, reset_subterm: bool) {
-        let mut epoch = Epoch::default();
+        // Carry forward witness_pending_req_seq so that request sequence numbers
+        // are monotonically increasing across epoch resets. This prevents a
+        // stale CAS callback (from an earlier subterm whose req_seq was reset
+        // to 0) from matching the current pending request and erroneously
+        // activating shortcut replication.
+        let carried_req_seq = self.epoch.witness_pending_req_seq;
+        let mut epoch = Epoch {
+            witness_pending_req_seq: carried_req_seq,
+            ..Default::default()
+        };
         epoch.subterm = if reset_subterm {
             0
         } else {
@@ -935,9 +944,11 @@ impl ProgressTracker {
         let old_epoch = &self.epoch;
         let mut new_epoch = Epoch {
             subterm: old_epoch.subterm + 1,
-            ..Default::default()
+            witness_pending_req_seq: old_epoch.witness_pending_req_seq,
+            ..old_epoch.clone()
         };
         let mut changed = false;
+        let mut side_changed = [false, false];
 
         for i in 0..2 {
             let set = &old_epoch.replication_sets[i];
@@ -1000,6 +1011,7 @@ impl ProgressTracker {
                                 non_witness_voters: new_non_witness,
                             };
                             changed = true;
+                            side_changed[i] = true;
                             continue;
                         }
                         // excluded is witness and no inactive found:
@@ -1040,6 +1052,7 @@ impl ProgressTracker {
                                 non_witness_voters: new_non_witness,
                             };
                             changed = true;
+                            side_changed[i] = true;
                             break;
                         }
                     }
@@ -1066,8 +1079,18 @@ impl ProgressTracker {
                             non_witness_voters: new_non_witness,
                         };
                         changed = true;
+                        side_changed[i] = true;
                     }
                 }
+            }
+        }
+
+        // For changed sides, reset witness state — old CAS confirmations
+        // and pending CAS are stale because the replication set changed.
+        for i in 0..2 {
+            if side_changed[i] {
+                new_epoch.witness_subterm[i] = 0;
+                new_epoch.witness_pending_subterm[i] = 0;
             }
         }
 

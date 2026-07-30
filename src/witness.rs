@@ -146,6 +146,18 @@ impl Witness {
         }
         self.lead = msg.from;
 
+        // Guard against delayed retries from an earlier subterm: if the last
+        // entry's (term, subterm) is strictly behind our current state, skip
+        // the update to prevent regressing witness state (last_log info and
+        // replication_set) which could cause incorrect vote decisions.
+        let entries = msg.get_entries();
+        if !entries.is_empty() {
+            let last = entries.last().unwrap();
+            if (last.term, last.subterm) < (self.last_log_term, self.last_log_subterm) {
+                return Some(WitnessResponse::Persist(self.to_hard_state()));
+            }
+        }
+
         // Update replication set. During joint consensus, the witness needs to
         // know voters from both halves so it can validate votes correctly.
         self.replication_set.clear();
@@ -155,7 +167,6 @@ impl Witness {
             .extend(msg.replication_set_outgoing.iter().copied());
 
         // Process entries.
-        let entries = msg.get_entries();
         if !entries.is_empty() {
             let last = entries.last().unwrap();
             self.last_log_term = last.term;
@@ -748,14 +759,14 @@ mod tests {
         w.last_log_term = 2;
         w.last_log_subterm = 1;
 
-        // Entries at index 3-4 (older than current 10).
+        // Entries at term 1, subterm 0 — strictly behind current (term=2, subterm=1).
+        // The witness must NOT regress its state.
         let msg = make_append_msg(1, 1, &[(3, 1, 0), (4, 1, 0)], 2);
         let resp = w.process(&msg);
         assert!(matches!(resp, Some(WitnessResponse::Persist(_))));
-        // With the last_log_index check removed, the witness always accepts
-        // entry term/subterm regardless of index ordering.
-        assert_eq!(w.last_log_term, 1);
-        assert_eq!(w.last_log_subterm, 0);
+        // State must remain unchanged — stale subterm append is ignored.
+        assert_eq!(w.last_log_term, 2);
+        assert_eq!(w.last_log_subterm, 1);
     }
 
     #[test]
@@ -814,6 +825,32 @@ mod tests {
         let resp = w.process(&msg);
         assert!(matches!(resp, Some(WitnessResponse::StaleTerm(3))));
         // witness state unchanged
+    }
+
+    #[test]
+    fn test_witness_append_stale_subterm_ignored() {
+        // P2-1 regression: a delayed append from an earlier subterm must not
+        // regress the witness's last_log info or replication_set.
+        //
+        // Scenario: witness already received entries at subterm 2. A delayed
+        // gRPC retry from subterm 1 arrives late. The witness must keep its
+        // newer state intact.
+        let mut w = Witness::new(3);
+        w.term = 5;
+        w.last_log_term = 5;
+        w.last_log_subterm = 2;
+        w.replication_set = vec![1, 2, 3].into_iter().collect();
+
+        // Delayed append: same term 5 but subterm 1 < 2.
+        let msg = make_append_msg(1, 5, &[(10, 5, 1)], 8);
+        let resp = w.process(&msg);
+        assert!(matches!(resp, Some(WitnessResponse::Persist(_))));
+
+        // State must NOT regress.
+        assert_eq!(w.last_log_subterm, 2, "subterm must not regress");
+        assert_eq!(w.last_log_term, 5);
+        // Replication set must remain unchanged.
+        assert!(w.replication_set.contains(&3));
     }
 
     // ══════════════════════════════════════════════════════════════
