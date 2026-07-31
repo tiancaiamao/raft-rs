@@ -45,8 +45,22 @@ impl Configuration {
     /// The bool flag indicates whether the index is computed by group commit algorithm
     /// successfully. It's true only when both majorities use group commit.
     pub fn committed_index(&self, use_group_commit: bool, l: &impl AckedIndexer) -> (u64, bool) {
-        let (i_idx, i_use_gc) = self.incoming.committed_index(use_group_commit, l);
-        let (o_idx, o_use_gc) = self.outgoing.committed_index(use_group_commit, l);
+        self.committed_index_split(use_group_commit, l, l)
+    }
+
+    /// Same as [`committed_index`](Configuration::committed_index), but allows
+    /// separate `AckedIndexer`s for the incoming and outgoing config halves.
+    /// Extended Raft callers use this to scope each half to its own
+    /// replication set (e.g. so an excluded witness does not count toward
+    /// quorum in the half that excluded it).
+    pub fn committed_index_split(
+        &self,
+        use_group_commit: bool,
+        l_in: &impl AckedIndexer,
+        l_out: &impl AckedIndexer,
+    ) -> (u64, bool) {
+        let (i_idx, i_use_gc) = self.incoming.committed_index(use_group_commit, l_in);
+        let (o_idx, o_use_gc) = self.outgoing.committed_index(use_group_commit, l_out);
         (cmp::min(i_idx, o_idx), i_use_gc && o_use_gc)
     }
 

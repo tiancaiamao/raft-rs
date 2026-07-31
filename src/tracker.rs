@@ -725,10 +725,22 @@ impl ProgressTracker {
     ///
     /// Eg. If the matched indexes are `[2,2,2,4,5]`, it will return `2`.
     /// If the matched indexes and groups are `[(1, 1), (2, 2), (3, 2)]`, it will return `1`.
+    ///
+    /// Nodes excluded from the replication set (see `Epoch::replication_sets`)
+    /// are reported as fully caught up so that their stale matched index does
+    /// not count toward quorum.
     pub fn maximal_committed_index(&mut self) -> (u64, bool) {
+        let idx_in = ReplicationSetAckIndexer {
+            indexer: &self.progress,
+            set: &self.epoch.replication_sets[0],
+        };
+        let idx_out = ReplicationSetAckIndexer {
+            indexer: &self.progress,
+            set: &self.epoch.replication_sets[1],
+        };
         self.conf
             .voters
-            .committed_index(self.group_commit, &self.progress)
+            .committed_index_split(self.group_commit, &idx_in, &idx_out)
     }
 
     /// Prepares for a new round of vote counting via recordVote.
@@ -1166,6 +1178,46 @@ impl<'a> AckedIndexer for ScopedAckIndexer<'a> {
     fn acked_index(&self, voter_id: u64) -> Option<Index> {
         if !self.scope.contains(&voter_id) {
             return None;
+        }
+        self.indexer.acked_index(voter_id)
+    }
+}
+
+/// An AckedIndexer for the replication-set model (Extended Raft 2F1A).
+///
+/// The node currently excluded from the replication set does not receive
+/// ordinary append messages, so its `matched` index is stale or permanently
+/// zero and must not be used directly for quorum computations. The correct
+/// treatment depends on *why* it is excluded:
+///
+/// - Excluded is the **witness** and the replication set still holds ≥ 2
+///   regular voters (steady state; also the joint conf-change safety check):
+///   the witness participates via shortcut replication (CAS), so report it
+///   as fully caught up (`u64::MAX`). Its permanent `matched = 0` would
+///   otherwise occupy a quorum slot and poison the joint-quorum commit
+///   computed by TiKV's conf-change safety check when a voter is added.
+/// - Excluded is a **regular voter** (degraded mode): report its real
+///   (stale) `matched` — it is the safety anchor that caps the commit index
+///   until the witness acks the entries beyond it.
+/// - Excluded is the **witness but the replication set has shrunk to a
+///   single voter** (witness evicted as unreachable): report the real
+///   `matched` (0) so the leader stalls instead of committing entries the
+///   unreachable witness has never seen.
+struct ReplicationSetAckIndexer<'a> {
+    indexer: &'a ProgressMap,
+    set: &'a ReplicationSet,
+}
+
+impl<'a> AckedIndexer for ReplicationSetAckIndexer<'a> {
+    fn acked_index(&self, voter_id: u64) -> Option<Index> {
+        if voter_id == self.set.excluded
+            && voter_id == self.set.witness
+            && self.set.non_witness_voters.len() >= 2
+        {
+            return Some(Index {
+                index: u64::MAX,
+                group_id: 0,
+            });
         }
         self.indexer.acked_index(voter_id)
     }
