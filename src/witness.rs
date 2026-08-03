@@ -17,9 +17,9 @@ use crate::eraftpb::{Entry, MessageType, WitnessHardState, WitnessMessage};
 /// The witness maintains:
 /// - Current term, vote, commit (like HardState)
 /// - Last log term, subterm (for tracking received entries)
-/// - Committed log term, subterm (for vote decisions — the witness compares
-///   a candidate's log against the COMMITTED log, not the received log,
-///   because shortcut-replicated entries may be uncommitted)
+/// - Committed log term, subterm (tracked from the leader's commit info;
+///   maintained for persistence/debugging — vote decisions compare against
+///   the received `last_log`, see `handle_vote`)
 /// - Leader ID
 /// - Replication set (for validating vote requests)
 #[derive(Default)]
@@ -46,7 +46,8 @@ pub struct Witness {
     /// Term of the entry at the committed index.
     /// Updated only when `msg.commit > self.commit` and we can determine
     /// the term (from `msg.commit_term` or from entries in the append).
-    /// Used in `handle_vote` for the log up-to-date comparison.
+    /// Maintained for persistence and debugging; NOT used for vote
+    /// decisions — `handle_vote` compares against `last_log_*`.
     pub committed_log_term: u64,
 
     /// Subterm of the entry at the committed index.

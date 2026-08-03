@@ -1197,7 +1197,7 @@ fn test_2f1w_commit_blocked_with_witness_excluded_and_follower_unreachable() {
 
     // Verify the witness shortcut path is not triggered.
     let (w0, _w1) = node.raft.prs().epoch.replicate_to_witness();
-        assert!(
+    assert!(
         !w0,
         "replicate_to_witness should be false when witness is excluded (excluded==witness)"
     );

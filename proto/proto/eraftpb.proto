@@ -222,10 +222,9 @@ message WitnessHardState {
     uint64 leader_id = 5;
     repeated uint64 replication_set = 6;
     repeated uint64 replication_set_outgoing = 7;
-    // Term of the entry at the committed index. Used for vote comparison
-    // — the witness compares the candidate's log against the committed
-    // log, not the received log (which may include uncommitted entries
-    // from shortcut replication).
+    // Term of the entry at the committed index. Tracked from the leader's
+    // commit info for persistence; the witness's vote decision compares
+    // against the received log (last_log_term), not the committed log.
     uint64 committed_log_term = 8;
     uint64 committed_log_subterm = 9;
 }
@@ -252,9 +251,9 @@ message WitnessMessage {
     bytes context = 12;
     repeated Entry entries = 13;
     uint64 commit = 14;
-    // Term/subterm of the entry at the commit index (commit). Used by the
-    // witness to track committed_log_term so it can distinguish committed
-    // entries from uncommitted shortcut-replicated entries when voting.
+        // Term/subterm of the entry at the commit index (commit). Used by the
+    // witness to update committed_log_term (persistence/debugging only —
+    // vote decisions compare against the received log).
     uint64 commit_term = 15;
     uint64 commit_subterm = 16;
     // request_seq is a monotonic counter per config half, used for gRPC

@@ -36,9 +36,9 @@ shortcut replication path, but does not run a full Raft instance.
 
 ### 1. Proto (`proto/proto/eraftpb.proto`)
 
-- Add `uint64 subterm = 7` to `Entry` (tag 7, after `context = 6`)
-- Add `uint64 witness = 6` and `uint64 witness_outgoing = 7` to `ConfState`
-- Add `ConfChangeAddWitness = 3` to `ConfChangeType`
+- Add `uint64 subterm = 1000` to `Entry` (tag 1000, after `context = 6`)
+- Add `uint64 witness = 1000` and `uint64 witness_outgoing = 1001` to `ConfState`
+- Add `ConfChangeAddWitness = 1000` to `ConfChangeType`
 - Add `WitnessHardState` message (for witness persistence)
 - Add `WitnessMessage` message (separate from regular `Message`, carries replication set info)
 
