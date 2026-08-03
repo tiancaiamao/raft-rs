@@ -540,7 +540,7 @@ pub use storage::{GetEntriesContext, RaftState, Storage};
 pub use tracker::{Epoch, ReplicationSet};
 pub use tracker::{Inflights, Progress, ProgressState, ProgressTracker};
 pub use util::majority;
-pub use witness::{Witness, WitnessResponse, WitnessStorage};
+pub use witness::{Witness, WitnessResponse};
 
 pub mod prelude {
     //! A "prelude" for crates using the `raft` crate.

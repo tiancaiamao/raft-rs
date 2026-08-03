@@ -86,12 +86,12 @@ fn test_witness_hard_state_proto() {
     whs.set_last_log_index(100);
     whs.set_last_log_term(5);
     whs.set_last_log_subterm(3);
-    whs.set_lead(1);
+    whs.set_leader_id(1);
     whs.set_replication_set(vec![1, 2]);
 
     assert_eq!(whs.get_last_log_index(), 100);
     assert_eq!(whs.get_last_log_subterm(), 3);
-    assert_eq!(whs.get_lead(), 1);
+    assert_eq!(whs.get_leader_id(), 1);
     assert_eq!(whs.get_replication_set(), &[1, 2]);
 }
 

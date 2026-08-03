@@ -14,8 +14,6 @@
 
 #![allow(clippy::useless_conversion)]
 
-use std::collections::HashSet;
-
 use raft::eraftpb::{
     ConfChangeSingle, ConfChangeTransition, ConfChangeType, ConfChangeV2, ConfState, Message,
     MessageType, WitnessMessage,
@@ -269,12 +267,12 @@ fn each_witness_must_store_only_the_replication_set_it_represents() {
     let w1_request = message_to(&requests, W1);
     let w2_request = message_to(&requests, W2);
 
-    let expected_w1: HashSet<u64> = w1_request
+    let expected_w1: Vec<u64> = w1_request
         .replication_set_outgoing
         .iter()
         .copied()
         .collect();
-    let expected_w2: HashSet<u64> = w2_request
+    let expected_w2: Vec<u64> = w2_request
         .replication_set_incoming
         .iter()
         .copied()

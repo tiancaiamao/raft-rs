@@ -33,7 +33,8 @@ message Entry {
 
     // Subterm is used by Extended Raft (witness support). It identifies a
     // replication epoch within a term. Defaults to 0 for standard Raft.
-    uint64 subterm = 7;
+    // Field number follows the kvproto downstream-fork convention (1000-1199).
+    uint64 subterm = 1000;
 }
 
 message SnapshotMetadata {
@@ -142,16 +143,19 @@ message ConfState {
     // Witness is the ID of the witness node in the incoming config.
     // A witness participates in elections and shortcut replication but
     // does not run a full Raft instance. 0 means no witness.
-    uint64 witness = 6;
+    // Field numbers follow the kvproto downstream-fork convention (1000-1199).
+    uint64 witness = 1000;
     // Witness in the outgoing config (for joint consensus).
-    uint64 witness_outgoing = 7;
+    uint64 witness_outgoing = 1001;
 }
 
 enum ConfChangeType {
     AddNode    = 0;
     RemoveNode = 1;
     AddLearnerNode = 2;
-    AddWitness = 3;
+    // Extended Raft (witness support). Value follows the kvproto
+    // downstream-fork convention (1000-1199) to avoid clashes with upstream.
+    AddWitness = 1000;
 }
 
 message ConfChange {
@@ -215,7 +219,7 @@ message WitnessHardState {
     uint64 last_log_index = 2;
     uint64 last_log_term = 3;
     uint64 last_log_subterm = 4;
-    uint64 lead = 5;
+    uint64 leader_id = 5;
     repeated uint64 replication_set = 6;
     repeated uint64 replication_set_outgoing = 7;
     // Term of the entry at the committed index. Used for vote comparison
@@ -247,7 +251,7 @@ message WitnessMessage {
     repeated bool vote_vals = 11;
     bytes context = 12;
     repeated Entry entries = 13;
-        uint64 commit = 14;
+    uint64 commit = 14;
     // Term/subterm of the entry at the commit index (commit). Used by the
     // witness to track committed_log_term so it can distinguish committed
     // entries from uncommitted shortcut-replicated entries when voting.

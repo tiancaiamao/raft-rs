@@ -4,16 +4,14 @@ Reference: [etcd-io/raft PR #168](https://github.com/etcd-io/raft/pull/168)
 
 ## Overview
 
-Extended Raft adds **witness** support to raft-rs, enabling 2F1A (2 fire + 1 available) region
+Extended Raft adds **witness** support to raft-rs, enabling 2F1A (2 Full Replicas + 1 Arbiter) region
 configurations. A witness is a special voter that participates in elections and commits via a
-shortcut replication path, but does not run a full Raft instance. In CSE, the witness is backed
-by S3/object storage.
+shortcut replication path, but does not run a full Raft instance.
 
 ## Key Concepts
 
-1. **Witness**: A voter node whose state is stored externally (S3). It votes in elections and
-   receives log entries via shortcut replication. It does not run RaftCore — it's a passive
-   responder.
+1. **Witness**: A voter node that participates in elections and receives log entries via
+   shortcut replication. It does not run RaftCore — it's a passive responder.
 
 2. **Subterm**: A monotonically increasing counter within a term. Incremented when:
    - A new leader is elected (new term → reset to 0 or new subterm)
@@ -24,8 +22,11 @@ by S3/object storage.
    exclude one node per subterm (the witness or an inactive voter). The leader adjusts it
    based on `RecentActive` status.
 
-4. **Shortcut Replication**: When q-1 voters have acked an entry, the leader sends it to the
-   witness. This is the key optimization — witness is contacted at most once per subterm.
+4. **Shortcut Replication**: When the replication set contains only the leader and one other
+   voter (e.g. {leader, A} in 2F1A), the leader can commit as soon as A acks — the witness is
+   not involved. The witness is only contacted when it is part of the replication set and its
+   ack is needed to reach quorum. This is the key optimization — witness is contacted at most
+   once per subterm.
 
 5. **Witness Vote**: A candidate needs q-1 regular votes before asking the witness to vote.
    The witness votes if `(term, subterm, lastLogIndex, lastLogTerm)` is up-to-date AND the
@@ -84,7 +85,6 @@ by S3/object storage.
 ### 6. Witness Module (`src/witness.rs`)
 
 - `Witness` struct: processes WitnessMessages from leader
-- `WitnessStorage` trait: `save()`, `load()`, `conditional_save()`
 - `process()`: handles MsgApp, MsgVote, MsgPreVote, MsgHeartbeat
 - Vote logic: check up-to-date + votesGranted ⊆ replicationSet
 
