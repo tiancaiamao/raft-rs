@@ -285,6 +285,35 @@ mod tests {
         assert_eq!(result[&2], 42);
     }
 
+    #[test]
+    fn test_excluded_witness_reports_real_matched_index() {
+        // Regression: the excluded witness must report its real matched index
+        // to the quorum computation, not u64::MAX. A fake "fully caught up"
+        // ack lets a leader with only its own ack commit entries that no
+        // other node has, violating the 2-copy safety requirement of 2F1A.
+        let mut tracker = make_tracker_with_witness(&[1, 2, 3], 3);
+        tracker.get_mut(1).unwrap().matched = 5;
+        tracker.get_mut(2).unwrap().matched = 0;
+        tracker.get_mut(3).unwrap().matched = 0;
+
+        let set = &tracker.epoch.replication_sets[0];
+        assert_eq!(set.witness, 3);
+        assert_eq!(set.excluded, 3); // steady state: witness excluded
+
+        {
+            let indexer = ReplicationSetAckIndexer {
+                indexer: &tracker.progress,
+                set,
+            };
+            // The excluded witness must not contribute a fake ack.
+            assert_eq!(indexer.acked_index(3).unwrap().index, 0);
+        }
+
+        // Only the leader acked → maximal committed index stays at 0.
+        let (mci, _) = tracker.maximal_committed_index();
+        assert_eq!(mci, 0);
+    }
+
     // ──────────────────────────────────────────────────────────────
     // one_less_than_quorum_in_replication_set
     // ──────────────────────────────────────────────────────────────
@@ -1187,22 +1216,19 @@ impl<'a> AckedIndexer for ScopedAckIndexer<'a> {
 ///
 /// The node currently excluded from the replication set does not receive
 /// ordinary append messages, so its `matched` index is stale or permanently
-/// zero and must not be used directly for quorum computations. The correct
-/// treatment depends on *why* it is excluded:
+/// zero. It still reports its real `matched` index — a fake "fully caught up"
+/// ack would let a leader commit entries that only it has (see
+/// `test_excluded_witness_reports_real_matched_index`). The quorum is
+/// therefore always computed from real acks:
 ///
-/// - Excluded is the **witness** and the replication set still holds ≥ 2
-///   regular voters (steady state; also the joint conf-change safety check):
-///   the witness participates via shortcut replication (CAS), so report it
-///   as fully caught up (`u64::MAX`). Its permanent `matched = 0` would
-///   otherwise occupy a quorum slot and poison the joint-quorum commit
-///   computed by TiKV's conf-change safety check when a voter is added.
-/// - Excluded is a **regular voter** (degraded mode): report its real
-///   (stale) `matched` — it is the safety anchor that caps the commit index
-///   until the witness acks the entries beyond it.
-/// - Excluded is the **witness but the replication set has shrunk to a
-///   single voter** (witness evicted as unreachable): report the real
-///   `matched` (0) so the leader stalls instead of committing entries the
-///   unreachable witness has never seen.
+/// - Excluded **witness** (steady state): the witness is not contacted while
+///   excluded (`replicate_to_witness` returns false), so it must not
+///   contribute any ack. If the remaining replication set reaches quorum on
+///   its own, the commit proceeds; otherwise it stalls — the correct 2-copy
+///   safety behavior.
+/// - Excluded **regular voter** (degraded mode): its stale `matched` is the
+///   safety anchor that caps the commit index until the witness acks the
+///   entries beyond it.
 struct ReplicationSetAckIndexer<'a> {
     indexer: &'a ProgressMap,
     set: &'a ReplicationSet,
@@ -1210,15 +1236,6 @@ struct ReplicationSetAckIndexer<'a> {
 
 impl<'a> AckedIndexer for ReplicationSetAckIndexer<'a> {
     fn acked_index(&self, voter_id: u64) -> Option<Index> {
-        if voter_id == self.set.excluded
-            && voter_id == self.set.witness
-            && self.set.non_witness_voters.len() >= 2
-        {
-            return Some(Index {
-                index: u64::MAX,
-                group_id: 0,
-            });
-        }
         self.indexer.acked_index(voter_id)
     }
 }

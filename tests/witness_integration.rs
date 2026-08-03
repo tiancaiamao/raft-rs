@@ -1197,9 +1197,60 @@ fn test_2f1w_commit_blocked_with_witness_excluded_and_follower_unreachable() {
 
     // Verify the witness shortcut path is not triggered.
     let (w0, _w1) = node.raft.prs().epoch.replicate_to_witness();
-    assert!(
+        assert!(
         !w0,
         "replicate_to_witness should be false when witness is excluded (excluded==witness)"
+    );
+}
+
+/// Verifies that a joint conf change promoting the witness to a full replica
+/// (2F1A → 3F) does not fake quorum: the excluded witness in the outgoing half
+/// reports its real matched index, so the joint commit blocks until the real
+/// quorum acks, then proceeds.
+#[test]
+fn test_joint_conf_change_witness_to_full_requires_real_quorum() {
+    let mut node = make_witness_node(1, vec![1, 2, 3], 3);
+    node.raft.become_candidate();
+    node.raft.become_leader();
+    persist_appended_entries(&mut node);
+
+    // Promote witness 3 to a full voter:
+    // old={1,2,3(witness)}, new={1,2,3(full)}.
+    let cc = joint_conf_change(vec![remove_node(3), add_node(3)]);
+    node.raft.apply_conf_change(&cc).unwrap();
+    persist_appended_entries(&mut node);
+
+    // 3 is a full voter in the new config, still the witness in the old one.
+    assert_eq!(node.raft.prs().conf().witnesses, [0, 3]);
+
+    // Outgoing half: witness 3 excluded from the replication set (steady
+    // state), replication set = {1, 2}.
+    let set1 = &node.raft.prs().epoch.replication_sets[1];
+    assert_eq!(set1.witness, 3);
+    assert_eq!(set1.excluded, 3);
+    assert!(set1.non_witness_voters.contains(&1));
+    assert!(set1.non_witness_voters.contains(&2));
+
+    // Safety: follower 2 unreachable (matched=0) and witness 3 not caught up
+    // (matched=0, it was removed and re-added by the conf change). Only the
+    // leader has acked, so the joint commit must NOT advance — the excluded
+    // witness must not contribute a fake u64::MAX ack.
+    let committed_before = node.raft.raft_log.committed;
+    node.raft.maybe_commit();
+    assert_eq!(
+        node.raft.raft_log.committed, committed_before,
+        "commit must not advance with only the leader acked during joint conf change"
+    );
+
+    // Liveness: follower 2 and witness 3 (caught up via shortcut replication)
+    // both ack. The joint quorum is met and the conf change commits.
+    let last = node.raft.raft_log.last_index();
+    node.raft.mut_prs().get_mut(2).unwrap().matched = last;
+    node.raft.mut_prs().get_mut(3).unwrap().matched = last;
+    node.raft.maybe_commit();
+    assert!(
+        node.raft.raft_log.committed > committed_before,
+        "joint conf change should commit once the real quorum acks"
     );
 }
 
