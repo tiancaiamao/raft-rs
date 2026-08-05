@@ -267,16 +267,8 @@ fn each_witness_must_store_only_the_replication_set_it_represents() {
     let w1_request = message_to(&requests, W1);
     let w2_request = message_to(&requests, W2);
 
-    let expected_w1: Vec<u64> = w1_request
-        .replication_set_outgoing
-        .iter()
-        .copied()
-        .collect();
-    let expected_w2: Vec<u64> = w2_request
-        .replication_set_incoming
-        .iter()
-        .copied()
-        .collect();
+    let expected_w1: Vec<u64> = w1_request.replication_set_outgoing.to_vec();
+    let expected_w2: Vec<u64> = w2_request.replication_set_incoming.to_vec();
     assert_ne!(expected_w1, expected_w2);
 
     // T1: The leader sends each witness a real first-write message. Each message

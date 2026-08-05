@@ -286,11 +286,12 @@ mod tests {
     }
 
     #[test]
-    fn test_excluded_witness_reports_real_matched_index() {
-        // Regression: the excluded witness must report its real matched index
-        // to the quorum computation, not u64::MAX. A fake "fully caught up"
-        // ack lets a leader with only its own ack commit entries that no
-        // other node has, violating the 2-copy safety requirement of 2F1A.
+    fn test_excluded_witness_contributes_no_ack() {
+        // Regression: the excluded witness must not contribute any ack to
+        // the quorum computation — neither a fake "fully caught up" ack nor
+        // its stale matched index. A fake ack lets a leader with only its
+        // own ack commit entries that no other node has, violating the
+        // 2-copy safety requirement of 2F1A.
         let mut tracker = make_tracker_with_witness(&[1, 2, 3], 3);
         tracker.get_mut(1).unwrap().matched = 5;
         tracker.get_mut(2).unwrap().matched = 0;
@@ -305,8 +306,10 @@ mod tests {
                 indexer: &tracker.progress,
                 set,
             };
-            // The excluded witness must not contribute a fake ack.
-            assert_eq!(indexer.acked_index(3).unwrap().index, 0);
+            // The excluded witness contributes no ack at all.
+            assert!(indexer.acked_index(3).is_none());
+            // Non-excluded voters still report their real matched index.
+            assert_eq!(indexer.acked_index(1).unwrap().index, 5);
         }
 
         // Only the leader acked → maximal committed index stays at 0.
@@ -991,7 +994,7 @@ impl ProgressTracker {
         let mut changed = false;
         let mut side_changed = [false, false];
 
-        for i in 0..2 {
+        for (i, side_changed_i) in side_changed.iter_mut().enumerate() {
             let set = &old_epoch.replication_sets[i];
 
             // ──────────────────────────────────────────────
@@ -1052,7 +1055,7 @@ impl ProgressTracker {
                                 non_witness_voters: new_non_witness,
                             };
                             changed = true;
-                            side_changed[i] = true;
+                            *side_changed_i = true;
                             continue;
                         }
                         // excluded is witness and no inactive found:
@@ -1093,7 +1096,7 @@ impl ProgressTracker {
                                 non_witness_voters: new_non_witness,
                             };
                             changed = true;
-                            side_changed[i] = true;
+                            *side_changed_i = true;
                             break;
                         }
                     }
@@ -1120,7 +1123,7 @@ impl ProgressTracker {
                             non_witness_voters: new_non_witness,
                         };
                         changed = true;
-                        side_changed[i] = true;
+                        *side_changed_i = true;
                     }
                 }
             }
@@ -1128,8 +1131,8 @@ impl ProgressTracker {
 
         // For changed sides, reset witness state — old CAS confirmations
         // and pending CAS are stale because the replication set changed.
-        for i in 0..2 {
-            if side_changed[i] {
+        for (i, &changed) in side_changed.iter().enumerate() {
+            if changed {
                 new_epoch.witness_subterm[i] = 0;
                 new_epoch.witness_pending_subterm[i] = 0;
             }
@@ -1216,10 +1219,7 @@ impl<'a> AckedIndexer for ScopedAckIndexer<'a> {
 ///
 /// The node currently excluded from the replication set does not receive
 /// ordinary append messages, so its `matched` index is stale or permanently
-/// zero. It still reports its real `matched` index — a fake "fully caught up"
-/// ack would let a leader commit entries that only it has (see
-/// `test_excluded_witness_reports_real_matched_index`). The quorum is
-/// therefore always computed from real acks:
+/// zero. The quorum is therefore always computed from real acks:
 ///
 /// - Excluded **witness** (steady state): the witness is not contacted while
 ///   excluded (`replicate_to_witness` returns false), so it must not
@@ -1236,6 +1236,17 @@ struct ReplicationSetAckIndexer<'a> {
 
 impl<'a> AckedIndexer for ReplicationSetAckIndexer<'a> {
     fn acked_index(&self, voter_id: u64) -> Option<Index> {
+        // An excluded witness (steady state) must not contribute an ack: it
+        // is not contacted while excluded, so its stale matched index must
+        // not count toward quorum. Excluded regular voters (degraded mode)
+        // still report their real matched index, which caps the commit index
+        // until the witness acks the entries beyond it.
+        if self.set.excluded != 0
+            && self.set.excluded == self.set.witness
+            && voter_id == self.set.excluded
+        {
+            return None;
+        }
         self.indexer.acked_index(voter_id)
     }
 }
