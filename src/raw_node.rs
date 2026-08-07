@@ -472,6 +472,40 @@ impl<T: Storage> RawNode<T> {
                     return;
                 }
 
+                // Witnesses are not replicated through the regular append path
+                // (maybe_send_append skips them). If the entries were fetched
+                // for a witness send, retry through the witness-specific path;
+                // otherwise the fetched result is never consumed and is simply
+                // discarded by the application, leaving the witness stuck.
+                if self.raft.prs().get(to).is_some_and(|pr| pr.is_witness) {
+                    if let Some(half) = self.raft.witness_config_half(to) {
+                        let current_subterm = self.raft.prs().epoch.subterm;
+                        // Mirror maybe_commit's branches: skip if the witness
+                        // was already contacted this subterm (shortcut
+                        // replication active) or an append is already in
+                        // flight; otherwise retry the send that failed with
+                        // LogTemporarilyUnavailable.
+                        if self.raft.prs().epoch.witness_subterm[half] != current_subterm
+                            && self.raft.prs().epoch.witness_pending_subterm[half] == 0
+                            && self.raft.send_append_to_witness(to, 0, half)
+                        {
+                            // Mirror maybe_commit: mark the append as in-flight
+                            // so that confirm_witness_append can activate
+                            // shortcut replication for the current subterm.
+                            self.raft.mut_prs().epoch.witness_pending_subterm[half] =
+                                current_subterm;
+                            // Mirror maybe_commit: mark the witness as recently
+                            // active to cover the window between CAS send and
+                            // confirm, preventing change_replication_set Case 3
+                            // from evicting it.
+                            if let Some(pr) = self.raft.mut_prs().get_mut(to) {
+                                pr.recent_active = true;
+                            }
+                        }
+                    }
+                    return;
+                }
+
                 if aggressively {
                     self.raft.send_append_aggressively(to)
                 } else {
@@ -841,9 +875,33 @@ impl<T: Storage> RawNode<T> {
 
 #[cfg(test)]
 mod test {
-    use crate::eraftpb::MessageType;
+    use crate::eraftpb::{ConfState, MessageType};
+    use crate::storage::{GetEntriesContext, GetEntriesFor, MemStorage};
+    use crate::{Config, RawNode};
+    use slog::{o, Logger};
 
     use super::is_local_msg;
+
+    fn make_logger() -> Logger {
+        Logger::root(slog::Discard, o!())
+    }
+
+    /// Creates a RawNode with a 2-voter + 1-witness config.
+    fn make_witness_node(node_id: u64, voters: Vec<u64>, witness: u64) -> RawNode<MemStorage> {
+        let logger = make_logger();
+        let storage = MemStorage::default();
+
+        let mut cs = ConfState::default();
+        cs.set_voters(voters.clone());
+        cs.set_witness(witness);
+        storage.initialize_with_conf_state(cs);
+
+        let config = Config {
+            id: node_id,
+            ..Default::default()
+        };
+        RawNode::new(&config, storage, &logger).unwrap()
+    }
 
     #[test]
     fn test_is_local_msg() {
@@ -871,5 +929,112 @@ mod test {
         for (msg_type, result) in tests {
             assert_eq!(is_local_msg(msg_type), result);
         }
+    }
+
+    /// A witness send that hits a disk-backed log gap triggers an async fetch
+    /// (the storage returns LogTemporarilyUnavailable). When the fetch
+    /// completes, the application must retry the witness send through the
+    /// witness-specific path; previously the retry fell into the regular
+    /// send_append path, which skips witnesses, and the fetched entries were
+    /// discarded — leaving the witness permanently stuck at next_idx.
+    #[test]
+    fn test_on_entries_fetched_retries_witness_append() {
+        let mut node = make_witness_node(1, vec![1, 2, 3], 3);
+        node.raft.become_candidate();
+        node.raft.become_leader();
+
+        // Put the witness in the replication set (half 0), with voter 2 excluded.
+        let epoch = &mut node.raft.mut_prs().epoch;
+        epoch.subterm = 1;
+        let set = &mut epoch.replication_sets[0];
+        set.excluded = 2;
+        set.non_witness_voters.clear();
+        set.non_witness_voters.insert(1);
+
+        let half = node
+            .raft
+            .witness_config_half(3)
+            .expect("witness 3 should be in half 0");
+        assert_eq!(half, 0);
+
+        let storage = node.store().clone();
+
+        // Append an entry so there is something to replicate to the witness.
+        node.propose(vec![], b"foo".to_vec()).unwrap();
+        assert!(
+            node.raft.raft_log.last_index() > node.raft.raft_log.first_index(),
+            "proposed entry should be appended"
+        );
+
+        // Persist the proposed entry so the read goes to storage (entries
+        // still in the unstable log are served from memory and never hit the
+        // async-fetch path we want to exercise).
+        let rd = node.ready();
+        storage.wl().append(&rd.entries).unwrap();
+        node.advance(rd);
+
+        // Sanity reset: with only voter 1 in the replication set, the q-1
+        // threshold is 0, so ready()/propose above cannot have triggered a
+        // witness send. Clear anyway so the test exercises only the
+        // async-fetch path (first send fails, pending_subterm stays 0).
+        node.raft.witness_msgs.clear();
+        node.raft.mut_prs().epoch.witness_pending_subterm[half] = 0;
+
+        // First send hits the "disk gap": the storage returns
+        // LogTemporarilyUnavailable and records the async fetch context.
+        storage.wl().trigger_log_unavailable(true);
+        let sent = node.raft.send_append_to_witness(3, 0, half);
+        assert!(
+            !sent,
+            "first send should report entries temporarily unavailable"
+        );
+        assert!(
+            node.raft.witness_msgs.is_empty(),
+            "no witness message should be built before the async fetch completes"
+        );
+        assert_eq!(
+            node.raft.prs().epoch.witness_pending_subterm[half],
+            0,
+            "pending_subterm should not be set before the send succeeds"
+        );
+
+        // The async fetch completes: the application notifies raft to retry.
+        let context = storage
+            .wl()
+            .take_get_entries_context()
+            .expect("async fetch context should have been recorded");
+        assert!(
+            matches!(context.0, GetEntriesFor::SendAppend { to: 3, .. }),
+            "context should target the witness"
+        );
+        storage.wl().trigger_log_unavailable(false);
+        node.on_entries_fetched(context);
+
+        // The retry must go through the witness path and actually send.
+        assert!(
+            !node.raft.witness_msgs.is_empty(),
+            "witness append should be built after the async fetch completes"
+        );
+        let msg = &node.raft.witness_msgs[0];
+        assert_eq!(msg.get_to(), 3);
+        assert_eq!(msg.get_msg_type(), MessageType::MsgAppend);
+        // The witness message's last_log_index is the index of the first entry
+        // being sent (the witness's assumed match index + 1), not the log tail.
+        assert_eq!(msg.get_last_log_index(), node.raft.raft_log.first_index());
+        assert!(!msg.get_entries().is_empty());
+        assert_eq!(
+            node.raft.prs().epoch.witness_pending_subterm[half],
+            node.raft.prs().epoch.subterm,
+            "pending_subterm should be set so confirm_witness_append can activate shortcut replication"
+        );
+        assert!(
+            node.raft.prs().get(3).unwrap().recent_active,
+            "the witness should be marked recently active to survive change_replication_set Case 3 during the CAS window"
+        );
+
+        // The witness message is delivered through Ready.
+        let rd = node.ready();
+        assert_eq!(rd.witness_messages.len(), 1);
+        assert_eq!(rd.witness_messages[0].get_to(), 3);
     }
 }

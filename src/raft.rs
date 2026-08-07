@@ -982,14 +982,19 @@ impl<T: Storage> Raft<T> {
 
     /// Sends entries to a witness via shortcut replication (Extended Raft).
     /// Returns which config half (0=incoming, 1=outgoing) a witness belongs to.
-    fn witness_config_half(&self, witness_id: u64) -> Option<usize> {
+    pub(super) fn witness_config_half(&self, witness_id: u64) -> Option<usize> {
         let epoch = &self.prs().epoch;
         (0..2).find(|&i| epoch.replication_sets[i].witness == witness_id)
     }
 
     /// Called when q-1 voters in the replication set have acknowledged entries
     /// up to `index`. The witness receives entries at most once per subterm.
-    fn send_append_to_witness(&mut self, witness_id: u64, _index: u64, half: usize) -> bool {
+    pub(super) fn send_append_to_witness(
+        &mut self,
+        witness_id: u64,
+        _index: u64,
+        half: usize,
+    ) -> bool {
         // Increment request sequence number for gRPC response ordering protection.
         let request_seq = {
             let next = self.prs.epoch.witness_pending_req_seq[half] + 1;
