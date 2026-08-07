@@ -2261,6 +2261,11 @@ impl<T: Storage> Raft<T> {
                 .0;
         }
 
+        // Precompute the leader's term at the acked index: it is needed to
+        // verify ack consistency below, and an immutable borrow of self cannot
+        // coexist with the mutable progress borrow taken next.
+        let leader_term_at_index = self.raft_log.term(m.index);
+
         let pr = match self.prs.get_mut(m.from) {
             Some(pr) => pr,
             None => {
@@ -2319,6 +2324,34 @@ impl<T: Storage> Raft<T> {
                 }
                 self.send_append(m.from);
             }
+            return;
+        }
+
+        // An ack asserts "I hold the leader's log prefix through m.index". The
+        // follower reports the term of the entry it actually matched (see
+        // handle_append_entries); trust the ack only if the leader's own log
+        // at m.index carries the same term. A mismatch means the follower acked
+        // an entry that does not exist in the leader's log (e.g. an empty
+        // append whose anchor term was corrupted in transit), and advancing
+        // matched would let the leader commit an entry the follower never
+        // replicated. log_term == 0 means the peer did not report a term (old
+        // peers), which we accept for backward compatibility.
+        let ack_consistent =
+            m.log_term == 0 || matches!(&leader_term_at_index, Ok(t) if *t == m.log_term);
+        if !ack_consistent {
+            warn!(
+                self.r.logger,
+                "received inconsistent append ack; not advancing matched";
+                "from" => m.from,
+                "index" => m.index,
+                "acked_log_term" => m.log_term,
+                "leader_log_term" => ?leader_term_at_index,
+            );
+            // Re-probe the follower so the true log state is re-established
+            // (the ack may have been built from an append that was already in
+            // flight and paused the progress; become_probe clears the pause).
+            pr.become_probe();
+            self.send_append(m.from);
             return;
         }
 
@@ -3093,6 +3126,9 @@ impl<T: Storage> Raft<T> {
             to_send.to = m.from;
             to_send.index = self.raft_log.committed;
             to_send.commit = self.raft_log.committed;
+            // Report the term of the entry at the acked index so the leader can
+            // verify the ack against its own log (see handle_append_response).
+            to_send.log_term = self.raft_log.term(self.raft_log.committed).unwrap_or(0);
             self.r.send(to_send, &mut self.msgs);
             return;
         }
@@ -3106,6 +3142,13 @@ impl<T: Storage> Raft<T> {
             .maybe_append(m.index, m.log_term, m.commit, &m.entries)
         {
             to_send.set_index(last_idx);
+            // Report the term of the entry the follower actually holds at the
+            // acked index (the anchor term for an empty append, the last
+            // appended entry's term otherwise). The leader verifies this
+            // against its own log before advancing matched, which makes a
+            // silent ack for an empty append anchored at a term that does not
+            // exist in the leader's log detectable.
+            to_send.log_term = self.raft_log.term(last_idx).unwrap_or(0);
         } else {
             debug!(
                 self.logger,
