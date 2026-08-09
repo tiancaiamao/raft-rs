@@ -71,6 +71,13 @@ shortcut replication path, but does not run a full Raft instance.
 - `maybe_commit()`: after regular commit check, find q-1 acks in replication set → send to witness
 - `maybe_send_append()`: skip witnesses (they don't receive regular AppEntries)
 - `bcast_heartbeat()`: send witness heartbeats to witness peers
+- `handle_heartbeat()`: liveness only — must NEVER advance the follower's
+  committed index. Committed only moves through the append path (where
+  `maybe_append` verifies log matching first) and snapshot restoration.
+  The leader may hold entries a follower has not matched (divergent log
+  branch, or a follower excluded from the leader's replication set);
+  committing them from a heartbeat would corrupt the follower's committed
+  index permanently and block catch-up.
 - New methods: `maybe_start_new_subterm()`, `send_append_to_witness()`,
   `send_request_vote_to_witness()`, `send_heartbeat_to_witness()`,
   `get_witness_vote_request_readiness()`
