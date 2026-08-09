@@ -3184,15 +3184,21 @@ impl<T: Storage> Raft<T> {
 
     // TODO: revoke pub when there is a better way to test.
     /// For a message, commit and send out heartbeat.
-    pub fn handle_heartbeat(&mut self, mut m: Message) {
-        // Clamp commit to last_index. The leader's view of this follower's
-        // matched index may be stale (e.g. after the follower restarted with
-        // a truncated raft log). Clamping prevents a fatal panic and is safe:
-        // the follower's committed position cannot exceed its last log entry,
-        // and the leader will discover the true position through the normal
-        // append/probe/snapshot protocol.
-        let commit = cmp::min(m.commit, self.raft_log.last_index());
-        self.raft_log.commit_to(commit);
+        pub fn handle_heartbeat(&mut self, mut m: Message) {
+        // A heartbeat must NOT advance this follower's committed index. The
+        // leader may hold entries this follower has not matched — e.g. after
+        // a divergent branch of the log, or while this follower is excluded
+        // from the leader's replication set. Committing such entries without
+        // log matching would violate Raft safety: the follower would report
+        // them as committed, yet they could later be overwritten by the real
+        // committed entries, permanently corrupting the follower's committed
+        // index (it never regresses) and blocking snapshot catch-up.
+        //
+        // `committed` only advances through the append path, where log
+        // matching is verified before the commit index may move, and through
+        // snapshot restoration. The leader learns this follower's actual
+        // committed index from the response below and drives catch-up via
+        // the normal append/probe/snapshot protocol.
         if self.pending_request_snapshot != INVALID_INDEX {
             self.send_request_snapshot();
             return;
