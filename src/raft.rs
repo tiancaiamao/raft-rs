@@ -2430,7 +2430,16 @@ impl<T: Storage> Raft<T> {
             pr.ins.free_first_one();
         }
         // Does it request snapshot?
-        if pr.matched < self.r.raft_log.last_index() || pr.pending_request_snapshot != INVALID_INDEX
+        // A follower may have matched the leader's last index (acknowledged
+        // every entry) yet still lag behind on committed — e.g. when the
+        // empty append that carried the new commit index was lost in
+        // transit. Since a heartbeat never advances committed (it is a
+        // liveness signal, not a commit signal), the leader must re-push
+        // the commit index via an append, which re-verifies log matching
+        // on the follower before its committed index may move.
+        if pr.matched < self.r.raft_log.last_index()
+            || pr.pending_request_snapshot != INVALID_INDEX
+            || pr.committed_index < self.r.raft_log.committed
         {
             self.r.send_append(m.from, pr, &mut self.msgs);
         }
