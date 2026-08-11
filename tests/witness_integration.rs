@@ -8,8 +8,8 @@
 #![allow(clippy::useless_conversion)]
 
 use raft::eraftpb::{
-    ConfChangeSingle, ConfChangeType, ConfState, Entry, MessageType, WitnessHardState,
-    WitnessMessage,
+    ConfChangeSingle, ConfChangeTransition, ConfChangeType, ConfChangeV2, ConfState, Entry,
+    MessageType, WitnessHardState, WitnessMessage,
 };
 use raft::raw_node::RawNode;
 use raft::storage::MemStorage;
@@ -788,7 +788,10 @@ fn test_witness_module_basic() {
     msg.vote_vals = vec![true, true];
 
     let resp = w.process(&msg);
-    assert!(matches!(resp, Some(raft::WitnessResponse::VoteGrant(true))));
+    assert!(matches!(
+        resp,
+        Some(raft::WitnessResponse::VotePersist { grant: true, .. })
+    ));
     assert_eq!(w.vote, 1);
 }
 
@@ -816,10 +819,15 @@ fn test_witness_module_reject_stale() {
     msg.vote_vals = vec![true];
 
     let resp = w.process(&msg);
+    // P0-1: The request is at a HIGHER term (2 > 1) and is rejected. The
+    // witness must still persist the advanced term (VotePersist) so a
+    // crash-restore doesn't revert it to term 1, where it could grant a vote
+    // in an already-superseded term.
     assert!(matches!(
         resp,
-        Some(raft::WitnessResponse::VoteGrant(false))
+        Some(raft::WitnessResponse::VotePersist { grant: false, .. })
     ));
+    assert_eq!(w.term, 2);
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -970,7 +978,10 @@ fn test_witness_vote_joint_consensus_validation() {
 
     let resp = w.process(&vote_msg);
     assert!(
-        matches!(resp, Some(raft::WitnessResponse::VoteGrant(true))),
+        matches!(
+            resp,
+            Some(raft::WitnessResponse::VotePersist { grant: true, .. })
+        ),
         "witness should grant vote even with outgoing-only voter"
     );
 }
@@ -1561,5 +1572,160 @@ fn test_request_seq_old_confirm_rejected_within_subterm() {
         node.raft.prs().epoch.witness_pending_subterm[0],
         0,
         "pending_subterm should be cleared"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// P1-6: joint consensus with the SAME witness in both halves
+// ═══════════════════════════════════════════════════════════════════
+
+#[test]
+fn test_joint_same_witness_append_includes_all_replication_sets() {
+    // P1-6 regression: when the same witness appears in both halves of a
+    // joint config and one half is already_contacted this subterm while the
+    // other is ready (first contact), the single append sent to the witness
+    // must carry the union of BOTH halves' replication sets. The witness's
+    // handle_append CLEARS and rebuilds replication_set from the message, so
+    // omitting the already-contacted half would drop its voters from the
+    // witness's view. During joint consensus, handle_vote Branch 3 requires
+    // mvotesGranted ⊆ replicationSet — a legitimate candidate whose granted
+    // voters include the dropped half would be rejected (election liveness
+    // failure).
+    let mut node = make_witness_node(1, vec![1, 2, 3], 3);
+    node.raft.become_candidate();
+    node.raft.become_leader();
+
+    // Enter a joint config where the SAME witness (3) is in both halves:
+    // old={1,2,3}, new={1,4,3}. apply_conf_change carries the incoming
+    // witness over to the outgoing half (see confchange changer).
+    let cc = ConfChangeV2 {
+        transition: ConfChangeTransition::Implicit.into(),
+        changes: vec![
+            ConfChangeSingle {
+                change_type: ConfChangeType::RemoveNode.into(),
+                node_id: 2,
+                ..Default::default()
+            },
+            ConfChangeSingle {
+                change_type: ConfChangeType::AddNode.into(),
+                node_id: 4,
+                ..Default::default()
+            },
+        ]
+        .into(),
+        ..Default::default()
+    };
+    node.raft.apply_conf_change(&cc).unwrap();
+    assert_eq!(
+        node.raft.prs().conf().witnesses,
+        [3, 3],
+        "same witness must be in both halves of the joint config"
+    );
+
+    // Set up replication sets: witness 3 in BOTH halves.
+    // Half 0 (incoming={1,3,4}): voters {1,4}, already contacted this subterm.
+    // Half 1 (outgoing={1,2,3}): voters {1,2}, NOT yet contacted (ready).
+    {
+        let epoch = &mut node.raft.mut_prs().epoch;
+        epoch.subterm = 7;
+        let r0 = &mut epoch.replication_sets[0];
+        r0.witness = 3;
+        r0.excluded = 0;
+        r0.non_witness_voters.clear();
+        r0.non_witness_voters.insert(1);
+        r0.non_witness_voters.insert(4);
+        let r1 = &mut epoch.replication_sets[1];
+        r1.witness = 3;
+        r1.excluded = 0;
+        r1.non_witness_voters.clear();
+        r1.non_witness_voters.insert(1);
+        r1.non_witness_voters.insert(2);
+        epoch.witness_subterm[0] = 7; // already_contacted → synthesized ack
+        epoch.witness_subterm[1] = 0; // ready → needs first append
+        epoch.witness_pending_subterm = [0, 0];
+    }
+
+    // Append one more entry so the witness (behind) has entries to receive.
+    let entry = Entry {
+        term: node.raft.term,
+        subterm: node.raft.prs().epoch.subterm,
+        ..Default::default()
+    };
+    let _ = node.raft.append_entry(&mut [entry]);
+    node.raft.raft_log.persisted = node.raft.raft_log.last_index();
+    let last_index = node.raft.raft_log.last_index();
+    assert_eq!(
+        last_index, 3,
+        "no-op + conf-change subterm entry + appended entry"
+    );
+
+    // Each half has 2 non-witness voters in scope → q-1 = 1.
+    // Half 0: voters {1,4} → q-1 idx = 1 (voter 1 matched=1, voter 4 behind).
+    // Half 1: voters {1,2} → q-1 idx = 1 (voter 1 matched=1, voter 2 behind).
+    node.raft.mut_prs().get_mut(1).unwrap().matched = 1;
+    node.raft.mut_prs().get_mut(2).unwrap().matched = 1;
+    node.raft.mut_prs().get_mut(4).unwrap().matched = 1;
+
+    let indices = node.raft.prs().one_less_than_quorum_in_replication_set();
+    assert!(
+        indices.iter().any(|&(h, _, _)| h == 0),
+        "incoming half must be considered: {indices:?}"
+    );
+    assert!(
+        indices.iter().any(|&(h, _, _)| h == 1),
+        "outgoing half must be considered: {indices:?}"
+    );
+
+    node.raft.maybe_commit();
+
+    // Exactly ONE append should be sent to witness 3 (dedup by witness_id).
+    let witness_msgs = node.raft.witness_msgs.clone();
+    node.raft.witness_msgs.clear();
+    let append_msgs: Vec<_> = witness_msgs
+        .iter()
+        .filter(|m| m.get_msg_type() == MessageType::MsgAppend && m.to == 3)
+        .collect();
+    assert_eq!(
+        append_msgs.len(),
+        1,
+        "should send exactly one append to witness 3: {witness_msgs:?}"
+    );
+    let msg = &append_msgs[0];
+
+    // The message must carry BOTH halves' replication sets (the union), even
+    // though only half 1 is "ready" — half 0 is already_contacted but its
+    // voters must not be dropped from the witness's view.
+    let mut incoming = msg.replication_set_incoming.clone();
+    incoming.sort_unstable();
+    assert_eq!(
+        incoming,
+        vec![1, 4],
+        "incoming half voters must be included (already-contacted half)"
+    );
+    let mut outgoing = msg.replication_set_outgoing.clone();
+    outgoing.sort_unstable();
+    assert_eq!(
+        outgoing,
+        vec![1, 2],
+        "outgoing half voters must be included (ready half)"
+    );
+
+    // Only the READY half (1) is marked pending. The already-contacted half
+    // (0) must keep witness_subterm set so shortcut replication keeps
+    // synthesizing acks — marking it pending would stall the commit.
+    assert_eq!(
+        node.raft.prs().epoch.witness_pending_subterm[0],
+        0,
+        "already-contacted half must not be marked pending"
+    );
+    assert_eq!(
+        node.raft.prs().epoch.witness_pending_subterm[1],
+        node.raft.prs().epoch.subterm,
+        "ready half must be marked pending"
+    );
+    assert_eq!(
+        node.raft.prs().epoch.witness_subterm[0],
+        node.raft.prs().epoch.subterm,
+        "already-contacted half keeps shortcut replication active"
     );
 }

@@ -113,6 +113,36 @@ shortcut replication path, but does not run a full Raft instance.
 
 ## Compatibility
 
+### No-witness mode (backward compatible)
+
 - No witness configured = standard Raft (subterm stays 0, replication set = all voters)
 - `subterm` field defaults to 0 (proto3 default), backward compatible on wire
 - Existing tests must pass without modification (when no witness is configured)
+
+### Mixed-version clusters (P1-7)
+
+When upgrading a cluster from standard Raft to Extended Raft (with witnesses),
+the following considerations apply:
+
+1. **Proto field numbers**: Extended Raft uses field numbers in the 1000+ range
+   (e.g., `Entry.subterm = 1000`, `SnapshotMetadata.subterm = 1000`). These
+   are unknown fields to old binaries, which will preserve them on the wire
+   but not interpret them.
+
+2. **Version gate in PD**: The actual decision to enable witness mode is gated
+   by PD (Placement Driver), which checks the cluster version. Only when all
+   stores are upgraded to the minimum supported version will PD allow creating
+   witness configurations.
+
+3. **Storage engine**: The storage engine (rfengine) must support:
+   - Reading/writing `subterm` on entries
+   - `WitnessMessage` processing (append + vote)
+   - CAS confirmation (`confirm_witness_append` / `reject_witness_append`)
+   - Snapshot subterm persistence
+
+4. **`commit_subterm = 0` in RequestVote**: When the leader sends a
+   `RequestVote` to a witness, `commit_subterm` is set to 0 (not the actual
+   epoch subterm). This is intentional — the witness should use its own
+   `committed_log_term` (updated via AppendEntries) for the log comparison,
+   not the leader's claimed commit position. This also ensures compatibility
+   with older witnesses that don't interpret `commit_subterm`.

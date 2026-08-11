@@ -189,6 +189,19 @@ impl Cluster {
                 let commit = state.get_state().commit;
                 if orig.get_msg_type() == MessageType::MsgAppend {
                     self.witness_append_count += 1;
+                    // P1-8: Persist the witness state (simulating a WAL write),
+                    // then confirm the append so shortcut replication activates.
+                    self.witness.restore(&state);
+
+                    // Confirm the CAS append on the leader.
+                    let leader_id = orig.from;
+                    let req_seq = orig.request_seq;
+                    if let Some(node_opt) = self.nodes.get_mut(&leader_id) {
+                        if let Some(node) = node_opt.as_mut() {
+                            node.raft.confirm_witness_append(self.witness_id, req_seq);
+                        }
+                    }
+
                     let mut m = Message::default();
                     m.set_msg_type(MessageType::MsgAppendResponse);
                     m.from = self.witness_id;
@@ -197,6 +210,21 @@ impl Cluster {
                     m.commit = commit;
                     self.pending_msgs.push(m);
                 }
+            }
+            WitnessResponse::VotePersist { state, grant } => {
+                // P0-1: Host must persist witness state BEFORE sending the
+                // vote reply. In the demo we simulate this by calling
+                // apply_state (writes to storage), mirroring what a real
+                // storage engine would do via a WAL.
+                self.witness.restore(&state);
+
+                let mut m = Message::default();
+                m.set_msg_type(MessageType::MsgRequestVoteResponse);
+                m.from = self.witness_id;
+                m.to = orig.from;
+                m.term = self.witness.term;
+                m.reject = !grant;
+                self.pending_msgs.push(m);
             }
             WitnessResponse::VoteGrant(granted) => {
                 let mut m = Message::default();

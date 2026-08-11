@@ -281,8 +281,9 @@ mod tests {
         // n=2 voters {1, 2}, scope=non_witness_voters={1, 2}.
         // acked_index(1)=42, acked_index(2)=0.
         // position = n/2 - 1 = 0 → the max of the sorted values.
-        assert!(result.contains_key(&2));
-        assert_eq!(result[&2], 42);
+        // Result is now Vec<(half, witness_id, idx)>.
+        let entry = result.iter().find(|(_, wid, _)| *wid == 2).unwrap();
+        assert_eq!(entry.2, 42);
     }
 
     #[test]
@@ -344,7 +345,8 @@ mod tests {
         assert_eq!(result.len(), 1);
         // quorum-1 from {1,2,3} = 1 voter ack needed.
         // n=3 voters, scoped to {1,3}. position = n/2-1 = 0 → max.
-        assert!(result[&3] >= 3);
+        let entry = result.iter().find(|(_, wid, _)| *wid == 3).unwrap();
+        assert!(entry.2 >= 3);
     }
 
     #[test]
@@ -368,7 +370,8 @@ mod tests {
         // n=4 voters, scoped to {1,3,4}. position = n/2-1 = 1 → 2nd highest.
         assert_eq!(result.len(), 1);
         // sorted desc: [10, 8, 6, 0], pos=1 → 8.
-        assert_eq!(result[&4], 8);
+        let entry = result.iter().find(|(_, wid, _)| *wid == 4).unwrap();
+        assert_eq!(entry.2, 8);
     }
 
     #[test]
@@ -415,6 +418,52 @@ mod tests {
         for id in 1u64..=3 {
             assert!(!tracker.get(id).unwrap().is_witness);
         }
+    }
+
+    #[test]
+    fn test_apply_conf_recomputes_is_witness_on_role_change() {
+        // P1-5: A node that was a non-witness can become a witness through
+        // a conf change. Without recomputation, its is_witness flag would
+        // be stale.
+        let mut tracker = ProgressTracker::with_capacity(3, 0, 256);
+
+        // Initial config: {1, 2} voters, 3 is witness.
+        let conf = Configuration {
+            voters: JointConfig::new(vec![1, 2].into_iter().collect()),
+            witnesses: [3, 0],
+            ..Default::default()
+        };
+        let changes: MapChange = vec![
+            (1, MapChangeType::Add),
+            (2, MapChangeType::Add),
+            (3, MapChangeType::Add),
+        ];
+        tracker.apply_conf(conf, changes, 1);
+        assert!(tracker.get(3).unwrap().is_witness);
+        assert!(!tracker.get(1).unwrap().is_witness);
+
+        // Now change: node 1 becomes witness, node 3 becomes voter.
+        // In joint config, node 1 is the outgoing witness, node 3 is the
+        // incoming witness — actually, let's do a simple swap.
+        // New config: {2, 3} voters, 1 is witness.
+        let conf2 = Configuration {
+            voters: JointConfig::new(vec![2, 3].into_iter().collect()),
+            witnesses: [1, 0],
+            ..Default::default()
+        };
+        // Node 1 and 3 already exist (no Add/Remove), so is_witness must be
+        // recomputed from the new conf.
+        let changes2: MapChange = vec![]; // no add/remove, just conf update
+        tracker.apply_conf(conf2, changes2, 1);
+
+        assert!(
+            tracker.get(1).unwrap().is_witness,
+            "node 1 should now be a witness"
+        );
+        assert!(
+            !tracker.get(3).unwrap().is_witness,
+            "node 3 should no longer be a witness"
+        );
     }
 
     // ──────────────────────────────────────────────────────────────
@@ -889,13 +938,27 @@ impl ProgressTracker {
                     // Otherwise, CheckQuorum may cause us to step down if it is invoked
                     // before the added node has had a chance to communicate with us.
                     pr.recent_active = true;
-                    // Set witness flag if this node is a witness.
-                    pr.is_witness = self.conf.witnesses[0] == id || self.conf.witnesses[1] == id;
                     self.progress.insert(id, pr);
                 }
                 MapChangeType::Remove => {
                     self.progress.remove(&id);
                 }
+            }
+        }
+
+        // P1-5: Recompute is_witness for ALL nodes after applying the conf
+        // change. A node's witness status can change without being removed
+        // and re-added (e.g. promoted from learner to witness-voter, or
+        // demoted). Without this recomputation, the is_witness flag would
+        // be stale, potentially causing the leader to send append entries
+        // to a node that is now a witness (via the normal path instead of
+        // the witness path) or vice versa.
+        let witness_incoming = self.conf.witnesses[0];
+        let witness_outgoing = self.conf.witnesses[1];
+        let ids: Vec<u64> = self.progress.keys().copied().collect();
+        for id in ids {
+            if let Some(pr) = self.progress.get_mut(&id) {
+                pr.is_witness = id == witness_incoming || id == witness_outgoing;
             }
         }
     }
@@ -1147,13 +1210,17 @@ impl ProgressTracker {
     /// For each witness that should receive shortcut replication, compute the
     /// committed index at quorum-1 within its replication set.
     /// Returns a map of witness_id → index.
-    pub fn one_less_than_quorum_in_replication_set(&self) -> HashMap<u64, u64> {
+    /// Returns a list of `(half, witness_id, q_minus_1_index)` tuples for
+    /// each config half that needs shortcut replication. Using a Vec of
+    /// tuples instead of a HashMap<witness_id, idx> avoids key collision
+    /// when the same witness appears in both halves of a joint config.
+    pub fn one_less_than_quorum_in_replication_set(&self) -> Vec<(usize, u64, u64)> {
         let (w0, w1) = self.epoch.replicate_to_witness();
         if !w0 && !w1 {
-            return HashMap::default();
+            return Vec::new();
         }
 
-        let mut result = HashMap::default();
+        let mut result = Vec::new();
 
         for (i, needs_witness) in [(0usize, w0), (1usize, w1)].iter() {
             if !needs_witness {
@@ -1171,7 +1238,7 @@ impl ProgressTracker {
             } else {
                 self.conf.voters.outgoing.one_less_than_quorum(&scoped)
             };
-            result.insert(set.witness, idx);
+            result.push((*i, set.witness, idx));
         }
 
         result

@@ -44,6 +44,9 @@ message SnapshotMetadata {
     uint64 index = 2;
     // The term of the applied index.
     uint64 term = 3;
+    // The subterm at the snapshot index (extended Raft).
+    // 0 for standard Raft or when no subterm fencing is in effect.
+    uint64 subterm = 1000;
 }
 
 message Snapshot {

@@ -989,16 +989,26 @@ impl<T: Storage> Raft<T> {
 
     /// Called when q-1 voters in the replication set have acknowledged entries
     /// up to `index`. The witness receives entries at most once per subterm.
-    pub(super) fn send_append_to_witness(
+    ///
+    /// `halves` specifies which config halves this witness belongs to. For a
+    /// witness in both halves of a joint config, we send ONE append with the
+    /// union of both replication sets (P1-6).
+    pub(super) fn send_append_to_witness_multi(
         &mut self,
         witness_id: u64,
-        _index: u64,
-        half: usize,
+        index: u64,
+        halves: &[usize],
     ) -> bool {
-        // Increment request sequence number for gRPC response ordering protection.
+        debug_assert!(!halves.is_empty());
+        // Use the first half's seq counter. Set ALL active halves to the same
+        // seq so that confirm_witness_append matches regardless of which half
+        // is checked.
+        let primary_half = halves[0];
         let request_seq = {
-            let next = self.prs.epoch.witness_pending_req_seq[half] + 1;
-            self.prs.epoch.witness_pending_req_seq[half] = next;
+            let next = self.prs.epoch.witness_pending_req_seq[primary_half] + 1;
+            for &h in halves {
+                self.prs.epoch.witness_pending_req_seq[h] = next;
+            }
             next
         };
 
@@ -1006,8 +1016,6 @@ impl<T: Storage> Raft<T> {
 
         // Send entries starting from the witness's match index + 1,
         // not from the q-1 index (which may skip entries the witness hasn't seen).
-        // Clamp to the log's first index: the witness is a logical entity and
-        // does not need entries that have already been compacted.
         let log_first = self.raft_log.first_index();
         let next_idx = self
             .prs()
@@ -1067,36 +1075,27 @@ impl<T: Storage> Raft<T> {
         msg.last_log_subterm = first.subterm;
         msg.last_log_index = first.index;
 
-        // Include replication set info — only for this witness's config half.
-        // Per the paper (Figure 2.3), AppendEntriesToWitnessRequest carries a
-        // single replication set. In joint consensus, W1 (outgoing) must only
-        // see the old config's replication set, and W2 (incoming) must only
-        // see the new config's. Sending both would cause the witness to
-        // persist the union, breaking the isolation required for correct
-        // witness voting (Figure 2.7: mvotesGranted ⊆ witnessReplicationSet).
-        let set = &epoch.replication_sets[half];
-        if half == 0 {
-            msg.replication_set_incoming = set.non_witness_voters.iter().copied().collect();
-        } else {
-            msg.replication_set_outgoing = set.non_witness_voters.iter().copied().collect();
+        // P1-6: Include replication sets for ALL active halves. When the same
+        // witness is in both halves of a joint config, we set both
+        // replication_set_incoming and replication_set_outgoing. The witness
+        // stores the union, which is correct for vote validation.
+        for &h in halves {
+            let set = &epoch.replication_sets[h];
+            if h == 0 {
+                msg.replication_set_incoming = set.non_witness_voters.iter().copied().collect();
+            } else {
+                msg.replication_set_outgoing = set.non_witness_voters.iter().copied().collect();
+            }
         }
 
         msg.entries = entries.into();
 
         // Set commit info so the witness can track committed_log_term
-        // separately from last_log_term (which may include uncommitted
-        // shortcut-replicated entries).
+        // separately from last_log_term.
         msg.commit = self.raft_log.committed;
         let (_, commit_term) = self.raft_log.commit_info();
         msg.commit_term = commit_term;
-        // commit_subterm tracks the epoch subterm for the committed entries.
-        // The current epoch subterm is a safe upper bound: after a subterm
-        // increment (due to replication set change during partition), all new
-        // entries are tagged with this subterm. Setting commit_subterm ensures
-        // the witness updates committed_log_subterm, which is compared in
-        // handle_vote to reject partitioned followers with stale subterms.
         msg.commit_subterm = self.prs().epoch.subterm;
-        // Attach request sequence number for gRPC response ordering.
         msg.request_seq = request_seq;
 
         self.witness_msgs.push(msg);
@@ -1108,8 +1107,24 @@ impl<T: Storage> Raft<T> {
             "num_entries" => num_entries,
             "term" => self.term,
             "subterm" => self.prs().epoch.subterm,
+            "one_less_than_quorum" => index,
+            "witness_matched_before" => next_idx.saturating_sub(1),
+            "log_first" => log_first,
+            "next_idx" => next_idx,
+            "request_seq" => request_seq,
+            "halves" => ?halves,
         );
         true
+    }
+
+    /// Single-half convenience wrapper for send_append_to_witness_multi.
+    pub(super) fn send_append_to_witness(
+        &mut self,
+        witness_id: u64,
+        index: u64,
+        half: usize,
+    ) -> bool {
+        self.send_append_to_witness_multi(witness_id, index, &[half])
     }
 
     /// Sends a RequestVote to a witness (Extended Raft).
@@ -1120,16 +1135,11 @@ impl<T: Storage> Raft<T> {
         vote_msg_type: MessageType,
         term: u64,
     ) {
-        let last_index = self.raft_log.last_index();
         let last_term = self.raft_log.last_term();
 
-        // Get the subterm of the last entry.
-        let last_subterm = self
-            .raft_log
-            .entries(last_index, 1, GetEntriesContext::empty(false))
-            .ok()
-            .and_then(|e| e.first().map(|entry| entry.subterm))
-            .unwrap_or(0);
+        // Get the subterm of the last entry via raft_log (handles both
+        // unstable entries and snapshot fallback).
+        let last_subterm = self.raft_log.last_subterm();
 
         let votes = self.prs.votes();
         let mut msg = WitnessMessage::default();
@@ -1145,6 +1155,10 @@ impl<T: Storage> Raft<T> {
         msg.commit = self.raft_log.committed;
         let (_, commit_term) = self.raft_log.commit_info();
         msg.commit_term = commit_term;
+        // P1-7: commit_subterm is intentionally 0. The witness uses its own
+        // committed_log_term (updated via AppendEntries) for log comparison,
+        // not the leader's claimed commit position. This is also compatible
+        // with older witnesses that don't interpret commit_subterm.
         msg.commit_subterm = 0;
 
         // Include current vote state.
@@ -1206,82 +1220,142 @@ impl<T: Storage> Raft<T> {
         // isn't committed yet.
         let witness_indices = self.mut_prs().one_less_than_quorum_in_replication_set();
         let current_subterm = self.prs().epoch.subterm;
-        for (witness_id, idx) in &witness_indices {
-            if *idx > 0 {
-                // Determine which config half this witness belongs to.
-                let half = self.witness_config_half(*witness_id);
-                if let Some(half) = half {
-                    let already_contacted =
-                        self.prs().epoch.witness_subterm[half] == current_subterm;
-                    if already_contacted {
-                        // Shortcut replication: synthesize the witness ack
-                        // without sending another RPC. The leader already
-                        // replicated to the witness this subterm.
-                        if let Some(pr) = self.mut_prs().get_mut(*witness_id) {
-                            if idx > &pr.matched {
-                                pr.matched = *idx;
-                                pr.state = ProgressState::Replicate;
-                            }
-                        }
-                    } else if self.prs().epoch.witness_pending_subterm[half] == 0 {
-                        // First contact this subterm: send actual entries.
-                        // witness_subterm is NOT set here — it is set only
-                        // after the external storage layer confirms the CAS
-                        // write succeeded (see confirm_witness_append). This
-                        // ensures shortcut replication never activates on a
-                        // stale leader whose witness state was overwritten.
-                        let sent = self.send_append_to_witness(*witness_id, *idx, half);
-                        if sent {
-                            self.mut_prs().epoch.witness_pending_subterm[half] = current_subterm;
-                            // Mark as recently active — we just sent a
-                            // request. This covers the window between CAS
-                            // send and response, preventing Case 3 from
-                            // evicting the witness before confirm arrives.
-                            if let Some(pr) = self.mut_prs().get_mut(*witness_id) {
-                                pr.recent_active = true;
-                            }
-                        }
+
+        // P1-6: Group by witness_id to handle the case where the same
+        // witness appears in both halves of a joint config. We send ONE
+        // append per witness (with the union of both replication sets),
+        // but track CAS confirmation per half.
+        //
+        // Step 1: Collect per-half state for each witness.
+        // For each (half, witness_id, idx), determine the action:
+        //   - already_contacted: synthesize ack
+        //   - pending: skip (waiting for CAS)
+        //   - ready: needs append (first contact)
+        // If ANY half is ready and no half is pending, we send ONE append.
+
+        // Track which halves have been processed for deduplication.
+        let mut halves_to_send: Vec<(usize, u64, u64)> = Vec::new(); // (half, witness_id, idx)
+        for (half, witness_id, idx) in &witness_indices {
+            if *idx == 0 {
+                continue;
+            }
+            let already_contacted = self.prs().epoch.witness_subterm[*half] == current_subterm;
+            let is_pending = self.prs().epoch.witness_pending_subterm[*half] != 0;
+
+            if already_contacted {
+                // Shortcut replication: synthesize the witness ack
+                // without sending another RPC. The leader already
+                // replicated to the witness this subterm.
+                if let Some(pr) = self.mut_prs().get_mut(*witness_id) {
+                    if idx > &pr.matched {
+                        pr.matched = *idx;
+                        pr.state = ProgressState::Replicate;
                     }
-                    // else: append already sent, awaiting CAS confirmation.
                 }
+            } else if is_pending {
+                // Append already sent, awaiting CAS confirmation.
+            } else {
+                // First contact this subterm: need to send entries.
+                halves_to_send.push((*half, *witness_id, *idx));
             }
         }
 
+        // Step 2: Deduplicate sends by witness_id. For the same witness in
+        // multiple halves, send ONE append and include ALL applicable
+        // replication sets.
+        halves_to_send.sort_by_key(|(_, wid, _)| *wid);
+        let mut i = 0;
+        while i < halves_to_send.len() {
+            let (first_half, witness_id, first_idx) = halves_to_send[i];
+            // Collect all halves for this witness.
+            let mut halves = vec![first_half];
+            let mut max_idx = first_idx;
+            let mut j = i + 1;
+            while j < halves_to_send.len() && halves_to_send[j].1 == witness_id {
+                halves.push(halves_to_send[j].0);
+                max_idx = max_idx.max(halves_to_send[j].2);
+                j += 1;
+            }
+
+            // P1-6: Also include ALL halves that contain this witness, not
+            // just the "ready" ones. The witness's `handle_append` CLEARS and
+            // rebuilds `replication_set` from the message, so omitting a half
+            // (e.g. one that is already_contacted this subterm and therefore
+            // only synthesized an ack) would drop that half's voters from the
+            // witness's view. During joint consensus, `handle_vote` Branch 3
+            // requires mvotesGranted ⊆ replicationSet, so a legitimate
+            // candidate whose granted voters include the dropped half would be
+            // rejected — an election liveness failure. Including the
+            // supplementary halves makes the message carry the complete union
+            // of replication sets.
+            let epoch = &self.prs().epoch;
+            for h in 0..2 {
+                if epoch.replication_sets[h].witness == witness_id && !halves.contains(&h) {
+                    halves.push(h);
+                }
+            }
+
+            // Send ONE append to the witness. The append includes entries
+            // up to max_idx and replication sets for ALL active halves.
+            let sent = self.send_append_to_witness_multi(witness_id, max_idx, &halves);
+            if sent {
+                // Only mark the READY halves (those in `halves_to_send`) as
+                // pending. Supplementary halves are already_contacted this
+                // subterm — they must keep `witness_subterm` set so shortcut
+                // replication continues to synthesize acks for them; marking
+                // them pending would suppress those synthesized acks and stall
+                // the commit.
+                for &(h, _, _) in &halves_to_send[i..j] {
+                    self.mut_prs().epoch.witness_pending_subterm[h] = current_subterm;
+                }
+                if let Some(pr) = self.mut_prs().get_mut(witness_id) {
+                    pr.recent_active = true;
+                }
+            }
+
+            i = j;
+        }
+
         let mci = self.mut_prs().maximal_committed_index().0;
-        if self.r.raft_log.maybe_commit(mci, self.r.term) {
+        let advanced = self.r.raft_log.maybe_commit(mci, self.r.term);
+        if advanced {
             let (self_id, committed) = (self.id, self.raft_log.committed);
             self.mut_prs()
                 .get_mut(self_id)
                 .unwrap()
                 .update_committed(committed);
-            return true;
         }
 
-        // Diagnostic: log when a leader with witnesses cannot commit.
-        // This is the key signal for partition-recovery write stalls.
-        // Only log when there are actually pending entries (mci > committed);
-        // otherwise the leader is simply idle and the message is noise.
-        if self.state == StateRole::Leader && self.has_witness() && mci > self.raft_log.committed {
-            let peer_states: Vec<(u64, u64, bool)> = self
+        // Log witness-related commit decisions for diagnosis. This captures
+        // term/subterm/configuration state at the point of commit advancement,
+        // which is essential for debugging 2F1A replication issues.
+        if advanced && self.has_witness() {
+            let peer_states: Vec<(u64, u64, u64, bool)> = self
                 .prs()
                 .progress()
                 .iter()
-                .map(|(&id, pr)| (id, pr.matched, pr.recent_active))
+                .map(|(&id, pr)| (id, pr.matched, pr.committed_index, pr.recent_active))
                 .collect();
             let r0 = &self.prs().epoch.replication_sets[0];
+            let r1 = &self.prs().epoch.replication_sets[1];
             info!(
                 self.logger,
-                "maybe_commit failed; no quorum yet";
+                "maybe_commit advanced";
                 "term" => self.term,
+                "subterm" => current_subterm,
                 "committed" => self.raft_log.committed,
                 "mci" => mci,
+                "witness_indices" => ?witness_indices,
                 "peers" => ?peer_states,
-                "witness" => r0.witness,
-                "excluded" => r0.excluded,
-                "non_witness_voters" => ?r0.non_witness_voters,
                 "witness_subterm" => ?self.prs().epoch.witness_subterm,
                 "witness_pending_subterm" => ?self.prs().epoch.witness_pending_subterm,
+                "r0" => ?r0,
+                "r1" => ?r1,
             );
+        }
+
+        if advanced {
+            return true;
         }
         false
     }
@@ -1294,7 +1368,13 @@ impl<T: Storage> Raft<T> {
     /// Must be called by the host application (CSE) after a successful `cas_save`
     /// for a `WitnessMessage(MsgAppend)`.
     pub fn confirm_witness_append(&mut self, witness_id: u64, req_seq: u64) {
-        if let Some(half) = self.witness_config_half(witness_id) {
+        // P1-6: Iterate over ALL halves that contain this witness, not just
+        // the first one. When the same witness is in both halves of a joint
+        // config, a single CAS confirmation activates shortcut for both.
+        let halves: Vec<usize> = (0..2)
+            .filter(|&i| self.prs().epoch.replication_sets[i].witness == witness_id)
+            .collect();
+        for half in halves {
             let current_subterm = self.prs().epoch.subterm;
             // Guard against stale confirmations: the pending subterm must
             // match the current subterm. If a new subterm has started
@@ -1304,12 +1384,13 @@ impl<T: Storage> Raft<T> {
             if self.prs().epoch.witness_pending_subterm[half] != current_subterm {
                 info!(
                     self.logger,
-                    "confirm_witness_append: stale (subterm), ignoring";
+                    "confirm_witness_append: stale (subterm), skipping half";
                     "witness_id" => witness_id,
+                    "half" => half,
                     "pending_subterm" => self.prs().epoch.witness_pending_subterm[half],
                     "current_subterm" => current_subterm,
                 );
-                return;
+                continue;
             }
             // Guard against out-of-order gRPC responses: the request sequence
             // number must match the current pending value. If a newer request
@@ -1317,44 +1398,39 @@ impl<T: Storage> Raft<T> {
             if self.prs().epoch.witness_pending_req_seq[half] != req_seq {
                 info!(
                     self.logger,
-                    "confirm_witness_append: stale (req_seq), ignoring";
+                    "confirm_witness_append: stale (req_seq), skipping half";
                     "witness_id" => witness_id,
+                    "half" => half,
                     "pending_req_seq" => self.prs().epoch.witness_pending_req_seq[half],
                     "req_seq" => req_seq,
                 );
-                return;
+                continue;
             }
             self.mut_prs().epoch.witness_subterm[half] = current_subterm;
             self.mut_prs().epoch.witness_pending_subterm[half] = 0;
-
-            // Mark the witness as recently active. Witnesses don't receive
-            // heartbeats or append responses through normal raft channels,
-            // so their recent_active is never set by the usual path. Without
-            // this, check_quorum_active() always sees the witness as inactive,
-            // and change_replication_set() Case 3 wrongly removes the witness
-            // from the replication set — degrading quorum from 2/3 to 1/3 and
-            // causing the leader to step down unnecessarily.
-            if let Some(pr) = self.mut_prs().get_mut(witness_id) {
-                pr.recent_active = true;
-            }
 
             info!(
                 self.logger,
                 "confirm_witness_append: shortcut replication activated";
                 "witness_id" => witness_id,
+                "half" => half,
                 "subterm" => current_subterm,
             );
+        }
 
-            // Immediately re-check commit. Now that witness_subterm is set,
-            // maybe_commit's shortcut replication will synthesize the witness
-            // ack, which may advance maximal_committed_index and commit the
-            // no-op entry. Without this call, the leader waits for the next
-            // MsgBeat or MsgCheckQuorum tick, introducing an unnecessary
-            // delay (up to election timeout).
-            if self.state == StateRole::Leader && self.maybe_commit() && self.should_bcast_commit()
-            {
-                self.bcast_append();
-            }
+        // Mark the witness as recently active (once, not per half).
+        if let Some(pr) = self.mut_prs().get_mut(witness_id) {
+            pr.recent_active = true;
+        }
+
+        // Immediately re-check commit. Now that witness_subterm is set,
+        // maybe_commit's shortcut replication will synthesize the witness
+        // ack, which may advance maximal_committed_index and commit the
+        // no-op entry. Without this call, the leader waits for the next
+        // MsgBeat or MsgCheckQuorum tick, introducing an unnecessary
+        // delay (up to election timeout).
+        if self.state == StateRole::Leader && self.maybe_commit() && self.should_bcast_commit() {
+            self.bcast_append();
         }
     }
 
@@ -1365,35 +1441,42 @@ impl<T: Storage> Raft<T> {
     /// a newer subterm), but this is harmless — the leader will be deposed by
     /// election timeout. On transient errors the retry provides recovery.
     pub fn reject_witness_append(&mut self, witness_id: u64, req_seq: u64) {
-        if let Some(half) = self.witness_config_half(witness_id) {
+        // P1-6: Iterate over ALL halves that contain this witness.
+        let halves: Vec<usize> = (0..2)
+            .filter(|&i| self.prs().epoch.replication_sets[i].witness == witness_id)
+            .collect();
+        for half in halves {
             let current_subterm = self.prs().epoch.subterm;
             // Guard against stale rejections, same rationale as confirm.
             if self.prs().epoch.witness_pending_subterm[half] != current_subterm {
                 info!(
                     self.logger,
-                    "reject_witness_append: stale (subterm), ignoring";
+                    "reject_witness_append: stale (subterm), skipping half";
                     "witness_id" => witness_id,
+                    "half" => half,
                     "pending_subterm" => self.prs().epoch.witness_pending_subterm[half],
                     "current_subterm" => current_subterm,
                 );
-                return;
+                continue;
             }
             // Guard against out-of-order gRPC responses.
             if self.prs().epoch.witness_pending_req_seq[half] != req_seq {
                 info!(
                     self.logger,
-                    "reject_witness_append: stale (req_seq), ignoring";
+                    "reject_witness_append: stale (req_seq), skipping half";
                     "witness_id" => witness_id,
+                    "half" => half,
                     "pending_req_seq" => self.prs().epoch.witness_pending_req_seq[half],
                     "req_seq" => req_seq,
                 );
-                return;
+                continue;
             }
             self.mut_prs().epoch.witness_pending_subterm[half] = 0;
             info!(
                 self.logger,
                 "reject_witness_append: CAS failed, will retry";
                 "witness_id" => witness_id,
+                "half" => half,
                 "subterm" => current_subterm,
             );
         }
@@ -1540,11 +1623,13 @@ impl<T: Storage> Raft<T> {
             "started new subterm";
             "term" => self.term,
             "subterm" => subterm,
+            "trigger" => if new_term { "new_term" } else if conf_change { "conf_change" } else { "liveness" },
             "r0_witness" => r0.witness,
             "r0_excluded" => r0.excluded,
             "r0_non_witness_voters" => ?r0.non_witness_voters,
             "r1_witness" => r1.witness,
             "r1_excluded" => r1.excluded,
+            "r1_non_witness_voters" => ?r1.non_witness_voters,
         );
         true
     }
@@ -3302,7 +3387,7 @@ impl<T: Storage> Raft<T> {
         // config. This shouldn't ever happen (at the time of writing) but lots of
         // code here and there assumes that r.id is in the progress tracker.
         let meta = snap.get_metadata();
-        let (snap_index, snap_term) = (meta.index, meta.term);
+        let (snap_index, snap_term, snap_subterm) = (meta.index, meta.term, meta.subterm);
         let cs = meta.get_conf_state();
         if cs
             .get_voters()
@@ -3367,6 +3452,13 @@ impl<T: Storage> Raft<T> {
         let pr = self.prs.get_mut(self.id).unwrap();
         pr.maybe_update(pr.next_idx - 1);
 
+        // P1-4: Restore subterm from snapshot metadata so that after a
+        // snapshot restore, the node's epoch subterm is consistent with
+        // the log it received via the snapshot. Without this, subterm
+        // resets to 0 (from `prs.clear()`), potentially allowing a stale
+        // witness to accept entries at the wrong subterm.
+        self.mut_prs().epoch.subterm = snap_subterm;
+
         self.pending_request_snapshot = INVALID_INDEX;
 
         info!(
@@ -3377,6 +3469,7 @@ impl<T: Storage> Raft<T> {
             "last_term" => self.raft_log.last_term(),
             "snapshot_index" => snap_index,
             "snapshot_term" => snap_term,
+            "snapshot_subterm" => snap_subterm,
         );
 
         true

@@ -1,0 +1,78 @@
+# Fix 3 Review Findings
+
+You are fixing 3 bugs found during code review of the raft-rs Extended Raft (witness/2F1A) implementation.
+All fixes must include tests that demonstrate the bug pre-fix and the resolution post-fix.
+
+## Finding 1 (HIGH): `last_subterm()` returns 0 for persisted entries
+
+**File**: `src/raft_log.rs`, function `last_subterm()` (line ~128)
+
+**Bug**: When entries have been persisted to the stable store (the common steady state), `stable_entries()` clears `unstable.entries`. Then `unstable.maybe_last_index()` returns None, and there's no snapshot → `last_subterm()` returns 0 even though the last entry has a nonzero subterm.
+
+**Impact**: `send_request_vote_to_witness` sends `last_log_subterm=0`. If the witness has seen subterm > 0 via shortcut replication, it rejects the candidate → election liveness failure.
+
+**Fix**: When unstable entries are empty, read the last entry's subterm from the store. The store trait has `entries(low, high, max_size)` method. Use it to fetch the entry at `last_index()` and read its `.subterm` field. Only fall back to snapshot subterm when `last_index() == snapshot.index`.
+
+Specifically, rewrite `last_subterm()`:
+1. If unstable has the last entry → return its subterm (current behavior, correct)
+2. If unstable is empty but we have a snapshot AND `last_index() == snapshot.index` → return snapshot's subterm
+3. Otherwise (unstable empty, last entry in store) → fetch the entry from `self.store.entries(last_idx, last_idx+1, GetEntriesContext::empty())` and return its subterm. Handle errors gracefully (return 0 on error).
+
+**Test**: Add `test_last_subterm_stable_store` that:
+- Creates a RaftLog with MemStorage
+- Appends entries with subterm > 0
+- Calls `stable_entries()` to simulate persistence
+- Asserts `last_subterm()` returns the correct subterm (not 0)
+
+## Finding 2 (MEDIUM-HIGH): P1-6 partial union of replication sets
+
+**File**: `src/raft.rs`, function `maybe_commit()` (line ~1216)
+
+**Bug**: In Step 2, `halves_to_send` only includes "ready" halves (first contact this subterm). When the same witness is in both halves of a joint config, if one half was `already_contacted` and the other is "ready", only the ready half's replication set is included in the append. But `witness.handle_append` CLEARS and rebuilds `replication_set` from the message — so the witness loses the already-contacted half's voters.
+
+**Impact**: During joint consensus, `handle_vote` Branch 3 requires `mvotesGranted ⊆ replicationSet`. The witness's replication set is missing voters from the not-included half → legitimate candidate rejected → election liveness failure.
+
+**Fix**: In Step 2, when grouping by witness_id, include replication sets for ALL halves that contain this witness — not just the "ready" ones. Specifically:
+
+1. After the dedup loop collects `halves` (the ready halves for this witness), also find ALL halves where `epoch.replication_sets[h].witness == witness_id` and add them to the `halves` list passed to `send_append_to_witness_multi`.
+2. This ensures the message always carries the complete union of replication sets.
+3. Only set `witness_pending_subterm` for the ready halves (those in `halves_to_send`), not the supplementary halves.
+4. The `send_append_to_witness_multi` already handles setting `replication_set_incoming`/`outgoing` for each half in the `halves` parameter, so including extra halves just adds more voter sets to the message.
+
+**Test**: Add a test that verifies `send_append_to_witness_multi` includes replication sets for ALL halves containing the witness, even when only one half is "ready". You can test this at the Raft level by checking the `witness_msgs` output.
+
+## Finding 3 (LOW-MODERATE): P0-1 incomplete persistence for rejected higher-term votes
+
+**File**: `src/witness.rs`, function `handle_vote()` (line ~200)
+
+**Bug**: For a real (non pre-vote) vote request at a higher term, `self.term` and `self.vote` are advanced in memory (line ~216: `if msg.term > self.term && !is_pre_vote { self.term = msg.term; self.vote = 0; }`). But if the vote is rejected (`grant=false`), the function returns `VoteGrant(false)` — no persistence. On crash-restore, the witness reverts to the old term.
+
+**Fix**: Track whether the term was advanced. If it was (regardless of grant/reject), return `VotePersist` so the host persists the new term before responding. The `grant` field reflects the actual decision.
+
+Change the return logic at the end of `handle_vote`:
+```rust
+let term_advanced = _old_term < self.term && !is_pre_vote;
+
+if (grant || term_advanced) && !is_pre_vote {
+    if grant {
+        self.vote = msg.from;
+    }
+    Some(WitnessResponse::VotePersist {
+        state: self.to_hard_state(),
+        grant,
+    })
+} else {
+    Some(WitnessResponse::VoteGrant(grant))
+}
+```
+
+**Test**: Add `test_witness_rejected_higher_term_vote_persists` that:
+- Sends a real vote at higher term where log_ok=false (rejected)
+- Asserts the response is `VotePersist` (not `VoteGrant(false)`)
+- Asserts the persisted state has the higher term
+
+## Important Notes
+- Proto field numbers use 1000+ range (downstream convention)
+- All fixes must compile: `cargo build` and `cargo test` must pass
+- Do NOT modify proto files for these fixes
+- Keep changes minimal and surgical

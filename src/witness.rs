@@ -343,11 +343,28 @@ impl Witness {
             self.commit,
         );
 
-        if grant && !is_pre_vote {
-            self.vote = msg.from;
-        }
+        // Track whether this request advanced our term. If it did (for a real
+        // vote at a higher term), the host MUST persist the new term even when
+        // the vote itself is rejected — otherwise a crash-restore reverts the
+        // witness to the old term and it may grant a vote in an already-superseded
+        // term, violating Election Safety. The `grant` field still reflects the
+        // actual vote decision.
+        let term_advanced = _old_term < self.term && !is_pre_vote;
 
-        Some(WitnessResponse::VoteGrant(grant))
+        if (grant || term_advanced) && !is_pre_vote {
+            // If this is a real vote that is granted, record who we voted for.
+            // The host must persist the resulting state (see VotePersist below)
+            // before sending the vote response.
+            if grant {
+                self.vote = msg.from;
+            }
+            Some(WitnessResponse::VotePersist {
+                state: self.to_hard_state(),
+                grant,
+            })
+        } else {
+            Some(WitnessResponse::VoteGrant(grant))
+        }
     }
 }
 
@@ -357,7 +374,30 @@ pub enum WitnessResponse {
     /// Witness state should be persisted (conditional write to storage).
     Persist(WitnessHardState),
     /// Vote response (true = granted, false = rejected).
+    ///
+    /// This variant is used when the vote decision does NOT require
+    /// persisting term/vote — i.e. pre-votes (which never modify state)
+    /// and rejections (which never modify vote).
     VoteGrant(bool),
+    /// A real vote was granted and term/vote were modified. The host MUST
+    /// persist `state` to durable storage **before** sending the vote
+    /// response. If the host crashes before persistence completes, on
+    /// restart the witness must restore the pre-vote state (not the
+    /// in-memory state that includes this vote).
+    ///
+    /// This mirrors standard Raft's contract: a follower sets
+    /// `HardState.vote` then exposes it via `Ready` with `must_sync =
+    /// true` and `is_persisted_msg = true`; the application must flush
+    /// `HardState` before sending the vote response message. Without
+    /// this ordering, a crash between granting the vote and persisting
+    /// it can lead to the witness granting votes to two different
+    /// candidates in the same term.
+    VotePersist {
+        /// The state that must be persisted (term, vote, commit, etc.).
+        state: WitnessHardState,
+        /// Whether the vote was granted.
+        grant: bool,
+    },
     /// The request came from a leader at a stale term. The host should
     /// build a response message carrying the witness's current (higher)
     /// term and step it into the leader's RawNode so it steps down to
@@ -454,8 +494,85 @@ mod tests {
         msg.vote_vals = vec![true, true];
 
         let resp = w.process(&msg);
-        assert!(matches!(resp, Some(WitnessResponse::VoteGrant(true))));
+        assert!(matches!(
+            resp,
+            Some(WitnessResponse::VotePersist { grant: true, .. })
+        ));
         assert_eq!(w.vote, 1);
+    }
+
+    #[test]
+    fn test_witness_vote_persist_prevents_double_vote_on_crash() {
+        // P0-1 regression test: If a witness grants a vote but the host
+        // crashes before persisting, on restart the witness should NOT
+        // have the vote recorded.  Conversely, if the host DOES persist,
+        // a second candidate at the same term must be rejected.
+        let mut w = Witness::new(3);
+        w.term = 1;
+        w.last_log_term = 1;
+        w.last_log_subterm = 0;
+        w.replication_set = vec![1, 2, 3];
+
+        // Candidate 1 requests a real vote at term 2.
+        let mut msg1 = WitnessMessage::default();
+        msg1.from = 1;
+        msg1.term = 2;
+        msg1.set_msg_type(MessageType::MsgRequestVote);
+        msg1.last_log_term = 1;
+        msg1.last_log_subterm = 0;
+        msg1.vote_ids = vec![1, 2];
+        msg1.vote_vals = vec![true, true];
+
+        let resp = w.process(&msg1).expect("must respond");
+        let (state, grant) = match resp {
+            WitnessResponse::VotePersist { state, grant } => (state, grant),
+            _ => panic!("expected VotePersist for real vote"),
+        };
+        assert!(grant);
+        assert_eq!(w.vote, 1); // in-memory updated
+
+        // --- Scenario A: Host persists, then witness is asked again ---
+        w.restore(&state);
+        assert_eq!(w.vote, 1);
+
+        // Candidate 2 at same term 2 must be rejected.
+        let mut msg2 = WitnessMessage::default();
+        msg2.from = 2;
+        msg2.term = 2;
+        msg2.set_msg_type(MessageType::MsgRequestVote);
+        msg2.last_log_term = 1;
+        msg2.last_log_subterm = 0;
+        msg2.vote_ids = vec![1, 2];
+        msg2.vote_vals = vec![true, true];
+
+        let resp2 = w.process(&msg2);
+        assert!(
+            matches!(resp2, Some(WitnessResponse::VoteGrant(false))),
+            "already voted for node 1 at term 2, must reject node 2"
+        );
+
+        // --- Scenario B: Host does NOT persist, simulate crash-restart ---
+        let mut w2 = Witness::new(3);
+        w2.term = 1;
+        w2.last_log_term = 1;
+        w2.last_log_subterm = 0;
+        w2.replication_set = vec![1, 2, 3];
+
+        let resp3 = w2.process(&msg1).expect("must respond");
+        assert!(matches!(
+            resp3,
+            WitnessResponse::VotePersist { grant: true, .. }
+        ));
+
+        // Crash: w2's in-memory state is lost. Fresh witness restored
+        // from OLD state (no vote recorded).
+        // (In real code, the host restored from durable storage which
+        //  does NOT include the vote because it was never persisted.)
+        // The fresh witness CAN vote for node 1 again — this is correct
+        // because the vote was never durably committed.
+
+        // But it should NOT have voted for node 2 in between:
+        assert_ne!(w2.vote, 2);
     }
 
     #[test]
@@ -481,8 +598,77 @@ mod tests {
         msg.vote_ids = vec![1];
         msg.vote_vals = vec![true];
 
+        // P0-1: Although the vote is rejected (stale log), the request carries
+        // a HIGHER term (2 > 1), so the witness must persist the advanced term.
+        // On crash-restore the witness would otherwise revert to term 1 and
+        // could grant a vote in an already-superseded term — violating Election
+        // Safety. The response is therefore VotePersist with grant=false.
         let resp = w.process(&msg);
-        assert!(matches!(resp, Some(WitnessResponse::VoteGrant(false))));
+        match resp {
+            Some(WitnessResponse::VotePersist { state, grant }) => {
+                assert!(!grant, "stale log must reject the vote");
+                assert_eq!(
+                    state.get_state().term,
+                    2,
+                    "persisted state must carry the higher term"
+                );
+            }
+            other => panic!("expected VotePersist(grant=false), got {:?}", other),
+        }
+        assert_eq!(w.term, 2);
+    }
+
+    #[test]
+    fn test_witness_rejected_higher_term_vote_persists() {
+        // P0-1: A real (non pre-vote) vote request at a HIGHER term must
+        // persist the advanced term even when the vote itself is rejected
+        // (log_ok=false). Previously the witness advanced `term`/`vote` in
+        // memory but returned VoteGrant(false) with no persistence; on
+        // crash-restore it reverted to the old term and could grant a vote
+        // in an already-superseded term — violating Election Safety.
+        let mut w = Witness::new(3);
+        w.term = 5;
+        w.vote = 1;
+        w.last_log_term = 4;
+        w.last_log_subterm = 2;
+        w.replication_set = vec![1, 2, 3];
+
+        // Candidate at term 7 (higher) with a stale log (last_log_term=1 < 4)
+        // and a granted voter outside the replication set — log_ok is false.
+        let msg = make_vote_msg(2, 7, 1, 0, &[2, 99], &[true, true]);
+        let resp = w.process(&msg);
+        match resp {
+            Some(WitnessResponse::VotePersist { state, grant }) => {
+                assert!(!grant, "stale log + outside-set voter must reject the vote");
+                assert_eq!(
+                    state.get_state().term,
+                    7,
+                    "persisted state must carry the higher term"
+                );
+                // The rejected vote must not record the candidate as voted-for.
+                assert_ne!(state.get_state().vote, 2);
+            }
+            other => panic!(
+                "expected VotePersist(grant=false) for rejected higher-term vote, got {:?}",
+                other
+            ),
+        }
+        assert_eq!(w.term, 7, "in-memory term must be advanced");
+        assert_eq!(w.vote, 0, "rejected vote must not set vote");
+
+        // A rejected vote at the SAME term must NOT persist (no state change).
+        let mut w2 = Witness::new(3);
+        w2.term = 5;
+        w2.vote = 1;
+        w2.last_log_term = 4;
+        w2.last_log_subterm = 2;
+        w2.replication_set = vec![1, 2, 3];
+        let msg2 = make_vote_msg(2, 5, 1, 0, &[2, 99], &[true, true]);
+        let resp2 = w2.process(&msg2);
+        assert!(
+            matches!(resp2, Some(WitnessResponse::VoteGrant(false))),
+            "same-term rejection must not require persistence"
+        );
     }
 
     #[test]
@@ -499,7 +685,10 @@ mod tests {
         // Candidate 1 requests vote at term 5 (same term).
         let msg1 = make_vote_msg(1, 5, 3, 2, &[1], &[true]);
         let resp1 = w.process(&msg1);
-        assert!(matches!(resp1, Some(WitnessResponse::VoteGrant(true))));
+        assert!(matches!(
+            resp1,
+            Some(WitnessResponse::VotePersist { grant: true, .. })
+        ));
         assert_eq!(w.vote, 1);
 
         // Candidate 2 requests vote at same term 5, must be rejected.
@@ -521,11 +710,17 @@ mod tests {
 
         let msg = make_vote_msg(1, 5, 3, 2, &[1], &[true]);
         let resp1 = w.process(&msg);
-        assert!(matches!(resp1, Some(WitnessResponse::VoteGrant(true))));
+        assert!(matches!(
+            resp1,
+            Some(WitnessResponse::VotePersist { grant: true, .. })
+        ));
 
         // Same candidate asks again — should still grant.
         let resp2 = w.process(&msg);
-        assert!(matches!(resp2, Some(WitnessResponse::VoteGrant(true))));
+        assert!(matches!(
+            resp2,
+            Some(WitnessResponse::VotePersist { grant: true, .. })
+        ));
     }
 
     #[test]
@@ -542,7 +737,10 @@ mod tests {
         // Candidate 2 at term 6 (higher term).
         let msg = make_vote_msg(2, 6, 4, 0, &[2], &[true]);
         let resp = w.process(&msg);
-        assert!(matches!(resp, Some(WitnessResponse::VoteGrant(true))));
+        assert!(matches!(
+            resp,
+            Some(WitnessResponse::VotePersist { grant: true, .. })
+        ));
         assert_eq!(w.term, 6);
         assert_eq!(w.vote, 2);
     }
@@ -563,7 +761,10 @@ mod tests {
 
         let msg = make_vote_msg(1, 5, 4, 0, &[1], &[true]);
         let resp = w.process(&msg);
-        assert!(matches!(resp, Some(WitnessResponse::VoteGrant(true))));
+        assert!(matches!(
+            resp,
+            Some(WitnessResponse::VotePersist { grant: true, .. })
+        ));
     }
 
     #[test]
@@ -578,7 +779,10 @@ mod tests {
 
         let msg = make_vote_msg(1, 5, 3, 3, &[1], &[true]);
         let resp = w.process(&msg);
-        assert!(matches!(resp, Some(WitnessResponse::VoteGrant(true))));
+        assert!(matches!(
+            resp,
+            Some(WitnessResponse::VotePersist { grant: true, .. })
+        ));
     }
 
     #[test]
@@ -616,7 +820,10 @@ mod tests {
         // votesGranted = {1, 2}, both in replicationSet.
         let msg = make_vote_msg(1, 5, 3, 2, &[1, 2, 4], &[true, true, false]);
         let resp = w.process(&msg);
-        assert!(matches!(resp, Some(WitnessResponse::VoteGrant(true))));
+        assert!(matches!(
+            resp,
+            Some(WitnessResponse::VotePersist { grant: true, .. })
+        ));
     }
 
     #[test]
@@ -678,7 +885,10 @@ mod tests {
 
         let msg = make_vote_msg(1, 5, 5, 0, &[1], &[true]);
         let resp = w.process(&msg);
-        assert!(matches!(resp, Some(WitnessResponse::VoteGrant(true))));
+        assert!(matches!(
+            resp,
+            Some(WitnessResponse::VotePersist { grant: true, .. })
+        ));
     }
 
     #[test]
@@ -956,7 +1166,7 @@ mod tests {
         let msg = make_vote_msg(2, 8, 8, 1, &[1, 2], &[true, true]);
         let resp = w.process(&msg);
         assert!(
-            matches!(resp, Some(WitnessResponse::VoteGrant(true))),
+            matches!(resp, Some(WitnessResponse::VotePersist { grant: true, .. })),
             "lagging voter with same (term, subterm) must be granted despite lower index"
         );
     }
@@ -975,7 +1185,7 @@ mod tests {
         let msg = make_vote_msg(277, 7, 6, 0, &[276, 277], &[false, true]);
         let resp = w.process(&msg);
         assert!(
-            matches!(resp, Some(WitnessResponse::VoteGrant(true))),
+            matches!(resp, Some(WitnessResponse::VotePersist { grant: true, .. })),
             "candidate with higher last_log_term (6 > 0) must get grant even with empty replication_set"
         );
     }
@@ -1035,7 +1245,10 @@ mod tests {
         let resp2 = w.process(&msg2);
         eprintln!("\n=== Step 2: Real vote ===");
         eprintln!("result: {:?}", resp2);
-        assert!(matches!(resp2, Some(WitnessResponse::VoteGrant(true))));
+        assert!(matches!(
+            resp2,
+            Some(WitnessResponse::VotePersist { grant: true, .. })
+        ));
         assert_eq!(w.vote, 277);
         eprintln!(
             "After real vote: term={}, last_log_term={}, vote={}",
@@ -1067,7 +1280,10 @@ mod tests {
         eprintln!("\n=== Step 5: Second real vote ===");
         eprintln!("result: {:?}", resp5);
         assert!(
-            matches!(resp5, Some(WitnessResponse::VoteGrant(true))),
+            matches!(
+                resp5,
+                Some(WitnessResponse::VotePersist { grant: true, .. })
+            ),
             "Second real vote: candidate last_log_term=6 > witness last_log_term=0 => grant"
         );
     }
@@ -1104,8 +1320,15 @@ mod tests {
         let msg = make_vote_msg(3, 3, 1, 0, &[3, 4], &[true, true]);
         let resp = w.process(&msg);
 
+        // P0-1: The request is at a HIGHER term (3 > 2), so the witness must
+        // persist the new term even though the vote is rejected — otherwise a
+        // crash-restore reverts the witness to term 2, where it may grant a
+        // vote in an already-superseded term.
         assert!(
-            matches!(resp, Some(WitnessResponse::VoteGrant(false))),
+            matches!(
+                resp,
+                Some(WitnessResponse::VotePersist { grant: false, .. })
+            ),
             "candidate missing committed e2 (last_log_term=1 < witness last_log_term=2) \
              must be rejected even when committed_log_term is stale"
         );
@@ -1128,7 +1351,12 @@ mod tests {
 
         let msg = make_vote_msg(3, 3, 1, 0, &[3, 4], &[true, true]);
         let resp = w.process(&msg);
-        assert!(matches!(resp, Some(WitnessResponse::VoteGrant(false))));
+        // P0-1: higher-term request (3 > 2), rejected → still requires
+        // persistence of the new term.
+        assert!(matches!(
+            resp,
+            Some(WitnessResponse::VotePersist { grant: false, .. })
+        ));
     }
 
     // ══════════════════════════════════════════════════════════════

@@ -119,6 +119,59 @@ impl<T: Storage> RaftLog<T> {
         }
     }
 
+    /// Returns the subterm of the last entry in the log.
+    ///
+    /// For Extended Raft (witness support), each entry carries a `subterm`
+    /// field. The subterm is resolved in priority order:
+    ///
+    /// 1. The last entry is in the unstable portion → its subterm is returned
+    ///    directly (the common case before persistence).
+    /// 2. The unstable portion is empty, but the last index is exactly the
+    ///    applied snapshot → the snapshot's subterm is used (the log has been
+    ///    compacted).
+    /// 3. The unstable portion is empty and the last entry lives in the
+    ///    stable store (the common steady state after `stable_entries()`
+    ///    cleared the unstable entries) → the entry is fetched from the store
+    ///    and its subterm is returned.
+    ///
+    /// Errors from the store are handled gracefully by returning 0.
+    pub fn last_subterm(&self) -> u64 {
+        let last_idx = self.last_index();
+        // Try the unstable entries first — this is the common case.
+        if let Some(unstable_last) = self.unstable.maybe_last_index() {
+            if last_idx <= unstable_last {
+                let offset = self.unstable.offset;
+                if last_idx >= offset {
+                    let pos = (last_idx - offset) as usize;
+                    if pos < self.unstable.entries.len() {
+                        return self.unstable.entries[pos].subterm;
+                    }
+                }
+            }
+        }
+        // The unstable portion has no entry for the last index. If the last
+        // entry is exactly the applied snapshot, fall back to its subterm.
+        if let Some(snap) = &self.unstable.snapshot {
+            let meta = snap.get_metadata();
+            if last_idx == meta.index {
+                return meta.subterm;
+            }
+        }
+        // Otherwise the last entry lives in the stable store (entries have
+        // been persisted and `stable_entries()` cleared the unstable portion).
+        // Fetch it to read its subterm; a missing/compacted entry means the
+        // log is empty, so 0 is the correct fallback.
+        match self.store.entries(
+            last_idx,
+            last_idx + 1,
+            NO_LIMIT,
+            GetEntriesContext::empty(false),
+        ) {
+            Ok(entries) => entries.first().map(|e| e.subterm).unwrap_or(0),
+            Err(_) => 0,
+        }
+    }
+
     /// Grab a read-only reference to the underlying storage.
     #[inline]
     pub fn store(&self) -> &T {
@@ -768,6 +821,86 @@ mod test {
         let mut snapshot = eraftpb::Snapshot::default();
         snapshot.set_metadata(meta);
         snapshot
+    }
+
+    #[test]
+    fn test_last_subterm() {
+        // P1-4: Verify last_subterm() correctly returns the subterm of the
+        // last entry, and falls back to snapshot subterm when entries are
+        // compacted.
+        let l = default_logger();
+        let store = MemStorage::new_with_conf_state((vec![1], vec![]));
+        let mut raft_log = RaftLog::new(store, l.clone(), &Config::default());
+
+        // Initially, no entries → last_subterm should be 0.
+        assert_eq!(raft_log.last_subterm(), 0);
+
+        // Append entries with subterms.
+        let mut e1 = new_entry(1, 1);
+        e1.subterm = 2;
+        let mut e2 = new_entry(2, 1);
+        e2.subterm = 3;
+        let mut e3 = new_entry(3, 1);
+        e3.subterm = 3;
+        raft_log.append(&[e1, e2, e3]);
+        assert_eq!(raft_log.last_subterm(), 3);
+
+        // Append an entry with higher subterm.
+        let mut e4 = new_entry(4, 1);
+        e4.subterm = 5;
+        raft_log.append(&[e4]);
+        assert_eq!(raft_log.last_subterm(), 5);
+
+        // Snapshot restore: snapshot with subterm=7.
+        let mut snap = new_snapshot(10, 2);
+        snap.mut_metadata().subterm = 7;
+        raft_log.restore(snap);
+        // After restore, the unstable entries are cleared. last_subterm
+        // should fall back to the snapshot's subterm.
+        assert_eq!(raft_log.last_subterm(), 7);
+    }
+
+    #[test]
+    fn test_last_subterm_stable_store() {
+        // P1-x: Verify last_subterm() correctly reads the last entry's subterm
+        // from the stable store once entries have been persisted. Previously
+        // `stable_entries()` cleared the unstable entries and, with no
+        // snapshot, `last_subterm()` returned 0 even though the persisted last
+        // entry had a nonzero subterm. That caused the leader to send
+        // `last_log_subterm=0` in `send_request_vote_to_witness`, so a witness
+        // that had seen a higher subterm via shortcut replication rejected the
+        // candidate → election liveness failure.
+        let l = default_logger();
+        let store = MemStorage::new_with_conf_state((vec![1], vec![]));
+        let mut raft_log = RaftLog::new(store, l.clone(), &Config::default());
+
+        // Append entries with nonzero subterms.
+        let mut e1 = new_entry(1, 1);
+        e1.subterm = 2;
+        let mut e2 = new_entry(2, 1);
+        e2.subterm = 3;
+        raft_log.append(&[e1, e2]);
+        assert_eq!(raft_log.last_subterm(), 3);
+
+        // Simulate persistence: write to the store, then clear the unstable
+        // portion via stable_entries() — the common steady state.
+        let entries = raft_log.unstable_entries().to_vec();
+        let last = entries.last().unwrap().clone();
+        raft_log.mut_store().wl().append(&entries).unwrap();
+        raft_log.stable_entries(last.index, last.term);
+        assert!(
+            raft_log.unstable_entries().is_empty(),
+            "unstable entries should be cleared after stable_entries"
+        );
+
+        // The last entry now lives in the stable store. last_subterm() must
+        // return its subterm (3), NOT 0.
+        assert_eq!(raft_log.last_subterm(), 3);
+
+        // Also verify the empty-log case still returns 0 without panicking.
+        let store2 = MemStorage::new_with_conf_state((vec![1], vec![]));
+        let raft_log2 = RaftLog::new(store2, l, &Config::default());
+        assert_eq!(raft_log2.last_subterm(), 0);
     }
 
     #[test]
