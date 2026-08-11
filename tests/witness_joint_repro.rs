@@ -85,11 +85,16 @@ fn run_check_quorum(node: &mut RawNode<MemStorage>) {
 
 /// Models a normal AppendEntries response from B after B has caught up.
 fn acknowledge_from_b(node: &mut RawNode<MemStorage>) {
+    let last_index = node.raft.raft_log.last_index();
     let mut msg = Message {
         from: B,
         to: A,
         term: node.raft.term,
-        index: node.raft.raft_log.last_index(),
+        index: last_index,
+        // A genuine follower reports the term of the entry it matched at the
+        // acked index (the leader verifies it in handle_append_response); a
+        // log_term of 0 would be treated as an inconsistent ack and ignored.
+        log_term: node.raft.raft_log.term(last_index).unwrap_or(0),
         ..Default::default()
     };
     msg.set_msg_type(MessageType::MsgAppendResponse);

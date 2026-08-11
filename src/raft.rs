@@ -2334,10 +2334,18 @@ impl<T: Storage> Raft<T> {
         // an entry that does not exist in the leader's log (e.g. an empty
         // append whose anchor term was corrupted in transit), and advancing
         // matched would let the leader commit an entry the follower never
-        // replicated. log_term == 0 means the peer did not report a term (old
-        // peers), which we accept for backward compatibility.
-        let ack_consistent =
-            m.log_term == 0 || matches!(&leader_term_at_index, Ok(t) if *t == m.log_term);
+        // replicated. A log_term of 0 means the response carried no term
+        // information (e.g. a snapshot response built without it) — trusting
+        // it would advance matched past the follower's true log position and
+        // pin the leader in an infinite reject loop, so treat it as
+        // inconsistent whenever the leader can verify the acked index.
+        let ack_consistent = match &leader_term_at_index {
+            // The leader's log covers the acked index: require an exact match.
+            Ok(t) => *t == m.log_term,
+            // The acked index is outside the leader's log (truncated, or the
+            // ack is ahead of the log); the leader cannot verify, accept.
+            Err(_) => true,
+        };
         if !ack_consistent {
             warn!(
                 self.r.logger,
@@ -2347,11 +2355,18 @@ impl<T: Storage> Raft<T> {
                 "acked_log_term" => m.log_term,
                 "leader_log_term" => ?leader_term_at_index,
             );
-            // Re-probe the follower so the true log state is re-established
-            // (the ack may have been built from an append that was already in
-            // flight and paused the progress; become_probe clears the pause).
-            pr.become_probe();
-            self.send_append(m.from);
+            // Do not re-send immediately and do not reset next_idx to
+            // matched+1: against a follower holding a divergent committed log
+            // (e.g. one excluded from a witness quorum) that would pin the
+            // leader in a tight send/reject loop, or a snapshot ping-pong
+            // when the leader's log is compacted. The heartbeat-driven probe
+            // (handle_heartbeat_response resumes the progress and re-sends)
+            // retries at heartbeat cadence instead. Leave Snapshot state so
+            // such probes are possible — a Snapshot progress is always paused
+            // and would otherwise stall replication forever.
+            if pr.state == ProgressState::Snapshot {
+                pr.become_probe();
+            }
             return;
         }
 
@@ -3193,7 +3208,7 @@ impl<T: Storage> Raft<T> {
 
     // TODO: revoke pub when there is a better way to test.
     /// For a message, commit and send out heartbeat.
-        pub fn handle_heartbeat(&mut self, mut m: Message) {
+    pub fn handle_heartbeat(&mut self, mut m: Message) {
         // A heartbeat must NOT advance this follower's committed index. The
         // leader may hold entries this follower has not matched — e.g. after
         // a divergent branch of the log, or while this follower is excluded
@@ -3236,6 +3251,13 @@ impl<T: Storage> Raft<T> {
             to_send.set_msg_type(MessageType::MsgAppendResponse);
             to_send.to = m.from;
             to_send.index = self.raft_log.last_index();
+            // Report the term of the entry at the acked index and the commit
+            // index so the leader can verify the ack against its own log (see
+            // handle_append_response). A snapshot ack without a term is
+            // indistinguishable from an unverifiable ack and can pin the
+            // leader's matched at a stale index.
+            to_send.log_term = self.raft_log.term(self.raft_log.last_index()).unwrap_or(0);
+            to_send.commit = self.raft_log.committed;
             self.r.send(to_send, &mut self.msgs);
         } else {
             info!(
@@ -3249,6 +3271,10 @@ impl<T: Storage> Raft<T> {
             to_send.set_msg_type(MessageType::MsgAppendResponse);
             to_send.to = m.from;
             to_send.index = self.raft_log.committed;
+            // Same as above: the acked index is the follower's committed index;
+            // report its term and commit so the leader can verify.
+            to_send.log_term = self.raft_log.term(self.raft_log.committed).unwrap_or(0);
+            to_send.commit = self.raft_log.committed;
             self.r.send(to_send, &mut self.msgs);
         }
     }

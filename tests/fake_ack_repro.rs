@@ -58,10 +58,11 @@ fn make_node(id: u64, entries: Vec<Entry>, hs: HardState) -> RawNode<MemStorage>
 }
 
 fn entry(index: u64, term: u64) -> Entry {
-    let mut e = Entry::default();
-    e.index = index;
-    e.term = term;
-    e
+    Entry {
+        index,
+        term,
+        ..Default::default()
+    }
 }
 
 /// Log of the old leader 154: entries 1..42 all in term 9, committed 41
@@ -205,12 +206,29 @@ fn fake_ack_is_rejected_when_acked_term_mismatches_leaders_log() {
         n1594.raft.raft_log.committed, 41,
         "42(t10) must not be committed"
     );
-    // A recovery probe must have been sent so the real state can be re-synced.
+    // No immediate re-probe: re-sending right away against a follower that
+    // keeps answering inconsistently would pin the leader in a tight
+    // send/reject loop (the log-divergence incident). The next probe is
+    // instead driven by the heartbeat.
+    assert!(
+        !drain_msgs(&mut n1594)
+            .into_iter()
+            .any(|m| m.get_msg_type() == MessageType::MsgAppend && m.to == LEADER_OLD),
+        "inconsistent ack must not trigger an immediate re-probe"
+    );
+
+    // A heartbeat response resumes the progress and re-probes.
+    let mut hb = Message::default();
+    hb.set_msg_type(MessageType::MsgHeartbeatResponse);
+    hb.from = LEADER_OLD;
+    hb.to = CANDIDATE;
+    hb.term = 10;
+    n1594.step(hb).unwrap();
     assert!(
         drain_msgs(&mut n1594)
             .into_iter()
             .any(|m| m.get_msg_type() == MessageType::MsgAppend && m.to == LEADER_OLD),
-        "leader must re-probe the inconsistent follower"
+        "heartbeat response drives the re-probe"
     );
 
     // Deliver a GENUINE ack: 154 has overwritten (42,t9) with (42,t10) and
@@ -277,4 +295,161 @@ fn empty_append_anchored_at_42_acks_silently_without_log_change() {
         !n154.raft.raft_log.match_term(resp.index, 10),
         "the silent ack does NOT correspond to an entry 154 holds"
     );
+}
+
+/// The observed incident shape (region 594, 2026-08-11): a term-37 leader whose
+/// log[626] = 36 probes a follower holding a divergent committed log
+/// (log[626] = 35, committed = 626). The follower ignored the leader's
+/// snapshot (older than its committed index) and answered with its committed
+/// index. Pre-fix, handle_snapshot's responses carried no log_term, so the
+/// leader's backward-compat check (`log_term == 0`) trusted the ack blindly,
+/// advanced matched to 626, and pinned replication in an infinite reject loop.
+#[test]
+fn snapshot_ack_without_term_must_not_advance_matched() {
+    // 1594: term-10 leader with log 1..41(t9) + noop 42(t10), committed 41.
+    let mut n1594 = make_node(
+        CANDIDATE,
+        {
+            let mut log = node1594_log();
+            log.push(entry(42, 10));
+            log
+        },
+        {
+            let mut hs = HardState::default();
+            hs.set_term(9);
+            hs.set_vote(CANDIDATE);
+            hs.set_commit(41);
+            hs
+        },
+    );
+    n1594.campaign().unwrap();
+    let mut witness_vote = Message::default();
+    witness_vote.set_msg_type(MessageType::MsgRequestVoteResponse);
+    witness_vote.from = WITNESS;
+    witness_vote.to = CANDIDATE;
+    witness_vote.term = 10;
+    witness_vote.reject = false;
+    n1594.step(witness_vote).unwrap();
+    assert_eq!(n1594.raft.state, raft::StateRole::Leader);
+    drain_msgs(&mut n1594);
+
+    // The follower acks index 42 but reports no term — exactly what
+    // handle_snapshot answered before the fix (a bare `index` only).
+    let mut ack = Message::default();
+    ack.set_msg_type(MessageType::MsgAppendResponse);
+    ack.from = LEADER_OLD;
+    ack.to = CANDIDATE;
+    ack.term = 10;
+    ack.index = 42;
+    ack.log_term = 0;
+    ack.reject = false;
+    n1594.step(ack).unwrap();
+
+    // The leader must NOT advance matched and must NOT commit 42: the ack
+    // carries no term evidence that the follower actually holds (42,t10).
+    assert!(
+        n1594.raft.prs().get(LEADER_OLD).unwrap().matched < 42,
+        "an ack without a term must not advance matched"
+    );
+    assert_eq!(
+        n1594.raft.raft_log.committed, 41,
+        "42(t10) must not be committed from a term-less ack"
+    );
+
+    // A genuine ack (correct term) still advances matched and commits.
+    let mut real_ack = Message::default();
+    real_ack.set_msg_type(MessageType::MsgAppendResponse);
+    real_ack.from = LEADER_OLD;
+    real_ack.to = CANDIDATE;
+    real_ack.term = 10;
+    real_ack.index = 42;
+    real_ack.log_term = 10;
+    real_ack.reject = false;
+    n1594.step(real_ack).unwrap();
+    assert_eq!(n1594.raft.prs().get(LEADER_OLD).unwrap().matched, 42);
+    assert_eq!(
+        n1594.raft.raft_log.committed, 42,
+        "genuine ack commits 42(t10)"
+    );
+}
+
+/// handle_snapshot's responses must report the term and commit of the acked
+/// index (mirroring handle_append_entries) so the leader can verify the ack.
+/// Pre-fix both branches answered with only an index: log_term == 0 and
+/// commit == 0, indistinguishable from an unverifiable ack.
+#[test]
+fn ignored_snapshot_response_reports_committed_term_and_commit() {
+    // 154: follower at term 9 with log 1..42(t9), committed 41.
+    let mut n154 = make_node(LEADER_OLD, node154_log(), {
+        let mut hs = HardState::default();
+        hs.set_term(9);
+        hs.set_vote(LEADER_OLD);
+        hs.set_commit(41);
+        hs
+    });
+
+    // A snapshot older than the follower's committed index (40 < 41) is
+    // ignored by restore(); the response must still carry the term/commit of
+    // the acked (committed) index.
+    let mut snap_msg = Message::default();
+    snap_msg.set_msg_type(MessageType::MsgSnapshot);
+    snap_msg.from = CANDIDATE;
+    snap_msg.to = LEADER_OLD;
+    snap_msg.term = 10;
+    let mut snap = raft::eraftpb::Snapshot::default();
+    let mut meta = raft::eraftpb::SnapshotMetadata::default();
+    meta.set_index(40);
+    meta.set_term(9);
+    snap.set_metadata(meta);
+    snap_msg.set_snapshot(snap);
+
+    n154.step(snap_msg).unwrap();
+    let resp = drain_msgs(&mut n154)
+        .into_iter()
+        .find(|m| m.get_msg_type() == MessageType::MsgAppendResponse)
+        .expect("154 must answer the snapshot");
+    assert!(!resp.reject);
+    assert_eq!(resp.index, 41, "ignored snapshot acks the committed index");
+    assert_eq!(resp.log_term, 9, "ack reports term(committed)");
+    assert_eq!(resp.commit, 41, "ack reports the committed index");
+}
+
+/// The restored-snapshot branch: a snapshot newer than the log is installed
+/// and the response reports the snapshot's last index and term.
+#[test]
+fn restored_snapshot_response_reports_last_index_term() {
+    // 154: follower at term 9 with log 1..42(t9), committed 41.
+    let mut n154 = make_node(LEADER_OLD, node154_log(), {
+        let mut hs = HardState::default();
+        hs.set_term(9);
+        hs.set_vote(LEADER_OLD);
+        hs.set_commit(41);
+        hs
+    });
+
+    let mut snap_msg = Message::default();
+    snap_msg.set_msg_type(MessageType::MsgSnapshot);
+    snap_msg.from = CANDIDATE;
+    snap_msg.to = LEADER_OLD;
+    snap_msg.term = 10;
+    let mut snap = raft::eraftpb::Snapshot::default();
+    let mut meta = raft::eraftpb::SnapshotMetadata::default();
+    meta.set_index(50);
+    meta.set_term(10);
+    let mut cs = raft::eraftpb::ConfState::default();
+    cs.set_voters(vec![LEADER_OLD, CANDIDATE, WITNESS]);
+    cs.set_witness(WITNESS);
+    meta.set_conf_state(cs);
+    snap.set_metadata(meta);
+    snap_msg.set_snapshot(snap);
+
+    n154.step(snap_msg).unwrap();
+    let resp = drain_msgs(&mut n154)
+        .into_iter()
+        .find(|m| m.get_msg_type() == MessageType::MsgAppendResponse)
+        .expect("154 must answer the snapshot");
+    assert!(!resp.reject);
+    assert_eq!(resp.index, 50, "restored snapshot acks its last index");
+    assert_eq!(resp.log_term, 10, "ack reports the snapshot's term");
+    assert_eq!(resp.commit, 50, "ack reports the restored committed index");
 }

@@ -177,7 +177,8 @@ fn test_leader_repushes_commit_to_lagging_follower() {
         .cloned()
         .expect("leader must re-push commit via append after heartbeat response");
     assert_eq!(
-        repush.get_commit(), 10,
+        repush.get_commit(),
+        10,
         "re-pushed append must carry the commit"
     );
     assert!(
