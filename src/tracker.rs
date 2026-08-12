@@ -963,19 +963,6 @@ impl ProgressTracker {
         }
     }
 
-    /// Returns true if the given peer is excluded from any replication set.
-    ///
-    /// The leader must not send entries or heartbeats to excluded voters,
-    /// because those entries carry the current subterm. Delivering a higher
-    /// subterm to an excluded voter breaks fencing: the voter could use it
-    /// to win a witness vote (via `handle_vote` Branch 2) before the witness
-    /// has persisted the new subterm via shortcut replication.
-    pub fn is_excluded_voter(&self, id: u64) -> bool {
-        id != 0
-            && (self.epoch.replication_sets[0].excluded == id
-                || self.epoch.replication_sets[1].excluded == id)
-    }
-
     /// Resets the replication set and optionally the subterm counter.
     /// Called when a new leader is elected (reset_subterm=true) or when
     /// a conf change is applied (reset_subterm=false, increment subterm).
