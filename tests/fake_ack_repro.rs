@@ -453,3 +453,111 @@ fn restored_snapshot_response_reports_last_index_term() {
     assert_eq!(resp.log_term, 10, "ack reports the snapshot's term");
     assert_eq!(resp.commit, 50, "ack reports the restored committed index");
 }
+
+/// Term-10 leader with log 1..100(t9) + noop 101(t10), committed 100, whose
+/// storage has been compacted at 91 (truncated_index = 90).
+fn make_compacted_leader() -> (RawNode<MemStorage>, MemStorage) {
+    let storage = MemStorage::default();
+    let mut cs = ConfState::default();
+    cs.set_voters(vec![LEADER_OLD, CANDIDATE, WITNESS]);
+    cs.set_witness(WITNESS);
+    storage.initialize_with_conf_state(cs);
+    storage
+        .wl()
+        .append(&(1..=100).map(|i| entry(i, 9)).collect::<Vec<_>>())
+        .unwrap();
+    let mut hs = HardState::default();
+    hs.set_term(9);
+    hs.set_vote(CANDIDATE);
+    hs.set_commit(100);
+    storage.wl().set_hardstate(hs);
+    let config = raft::Config {
+        id: CANDIDATE,
+        election_tick: 10,
+        heartbeat_tick: 2,
+        check_quorum: true,
+        // Real peers always have applied >= truncated_index; 90 is the
+        // compaction anchor here (compact(91) => truncated_index = 90).
+        applied: 90,
+        ..Default::default()
+    };
+    let mut n = RawNode::new(&config, storage.clone(), &logger()).unwrap();
+    storage.wl().compact(91).unwrap();
+
+    n.campaign().unwrap();
+    let mut witness_vote = Message::default();
+    witness_vote.set_msg_type(MessageType::MsgRequestVoteResponse);
+    witness_vote.from = WITNESS;
+    witness_vote.to = CANDIDATE;
+    witness_vote.term = 10;
+    witness_vote.reject = false;
+    n.step(witness_vote).unwrap();
+    assert_eq!(n.raft.state, raft::StateRole::Leader);
+    drain_msgs(&mut n);
+    (n, storage)
+}
+
+/// The incident shape (region 605/623/637): a follower acks a snapshot index
+/// the leader has already compacted away. `raft_log.term(index)` returns
+/// Ok(0) — indistinguishable from "beyond the log end" — so pre-fix the term
+/// check rejected the ack and stalled replication. The acked index is below
+/// the leader's committed index, so accepting it cannot advance the commit
+/// index, and any lie is caught by the next append probe from index+1.
+#[test]
+fn compacted_ack_with_real_term_is_accepted() {
+    let (mut n, _storage) = make_compacted_leader();
+    assert_eq!(
+        n.raft.raft_log.term(50).unwrap(),
+        0,
+        "50 is compacted away: the leader can no longer look up its term"
+    );
+
+    // The follower restored the leader's snapshot at 50 and acks (50, t9).
+    let mut ack = Message::default();
+    ack.set_msg_type(MessageType::MsgAppendResponse);
+    ack.from = LEADER_OLD;
+    ack.to = CANDIDATE;
+    ack.term = 10;
+    ack.index = 50;
+    ack.log_term = 9;
+    ack.reject = false;
+    n.step(ack).unwrap();
+    assert_eq!(
+        n.raft.prs().get(LEADER_OLD).unwrap().matched,
+        50,
+        "an ack below committed must be accepted even if compacted away"
+    );
+    assert_eq!(
+        n.raft.raft_log.committed, 100,
+        "accepting an ack below committed must not raise the commit index"
+    );
+}
+
+/// The other Ok(0) case must keep being rejected: an ack for an index beyond
+/// the leader's log end (> last_index, hence > committed) with a non-zero
+/// term asserts an entry that cannot exist in the leader's log; trusting it
+/// could commit entries the follower never replicated.
+#[test]
+fn ack_beyond_log_end_with_wrong_term_is_rejected() {
+    let (mut n, _storage) = make_compacted_leader();
+    let last_index = n.raft.raft_log.last_index();
+    assert!(
+        n.raft.raft_log.term(200).unwrap() == 0 && 200 > last_index,
+        "200 must be beyond the leader's log end"
+    );
+
+    let mut ack = Message::default();
+    ack.set_msg_type(MessageType::MsgAppendResponse);
+    ack.from = LEADER_OLD;
+    ack.to = CANDIDATE;
+    ack.term = 10;
+    ack.index = 200;
+    ack.log_term = 5;
+    ack.reject = false;
+    n.step(ack).unwrap();
+    assert_eq!(
+        n.raft.prs().get(LEADER_OLD).unwrap().matched,
+        0,
+        "an ack beyond the leader's log end must not advance matched"
+    );
+}

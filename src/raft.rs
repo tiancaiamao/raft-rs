@@ -2402,10 +2402,12 @@ impl<T: Storage> Raft<T> {
                 .0;
         }
 
-        // Precompute the leader's term at the acked index: it is needed to
-        // verify ack consistency below, and an immutable borrow of self cannot
-        // coexist with the mutable progress borrow taken next.
+        // Precompute the leader's term and committed index at the acked
+        // index: they are needed to verify ack consistency below, and an
+        // immutable borrow of self cannot coexist with the mutable progress
+        // borrow taken next.
         let leader_term_at_index = self.raft_log.term(m.index);
+        let committed = self.raft_log.committed;
 
         let excluded = self.has_witness() && self.prs.is_excluded_voter(m.from);
         let pr = match self.prs.get_mut(m.from) {
@@ -2482,8 +2484,13 @@ impl<T: Storage> Raft<T> {
         // pin the leader in an infinite reject loop, so treat it as
         // inconsistent whenever the leader can verify the acked index.
         let ack_consistent = match &leader_term_at_index {
-            // The leader's log covers the acked index: require an exact match.
-            Ok(t) => *t == m.log_term,
+            // The leader's log covers the acked index: require an exact match,
+            // unless the acked index is already committed. An ack for a
+            // committed index cannot advance the leader's commit index past
+            // `committed`, so it is safe to accept even when the leader's log
+            // no longer covers it (e.g. the entries were compacted away); any
+            // lie is caught by the next append probe from index+1.
+            Ok(t) => *t == m.log_term || m.index <= committed,
             // The acked index is outside the leader's log (truncated, or the
             // ack is ahead of the log); the leader cannot verify, accept.
             Err(_) => true,
