@@ -906,13 +906,25 @@ impl<T: Storage> Raft<T> {
 
     /// Sends RPC, with entries to all peers that are not up-to-date
     /// according to the progress recorded in r.prs().
+    ///
+    /// In Extended Raft, voters excluded from the replication set are
+    /// skipped to preserve subterm fencing (see `is_excluded_voter`).
     pub fn bcast_append(&mut self) {
         let self_id = self.id;
+        let excluded: Vec<u64> = if self.has_witness() {
+            self.prs
+                .iter()
+                .filter(|&(id, _)| self.prs.is_excluded_voter(*id))
+                .map(|(id, _)| *id)
+                .collect()
+        } else {
+            Vec::new()
+        };
         let core = &mut self.r;
         let msgs = &mut self.msgs;
         self.prs
             .iter_mut()
-            .filter(|&(id, _)| *id != self_id)
+            .filter(|&(id, _)| *id != self_id && !excluded.contains(id))
             .for_each(|(id, pr)| core.send_append(*id, pr, msgs));
     }
 
@@ -931,11 +943,20 @@ impl<T: Storage> Raft<T> {
 
     fn bcast_heartbeat_with_ctx(&mut self, ctx: Option<Vec<u8>>) {
         let self_id = self.id;
+        let excluded: Vec<u64> = if self.has_witness() {
+            self.prs
+                .iter()
+                .filter(|&(id, _)| self.prs.is_excluded_voter(*id))
+                .map(|(id, _)| *id)
+                .collect()
+        } else {
+            Vec::new()
+        };
         let core = &mut self.r;
         let msgs = &mut self.msgs;
         self.prs
             .iter_mut()
-            .filter(|&(id, _)| *id != self_id)
+            .filter(|&(id, _)| *id != self_id && !excluded.contains(id))
             .filter(|(_, pr)| !pr.is_witness)
             .for_each(|(id, pr)| {
                 core.send_heartbeat(*id, pr, ctx.clone(), msgs);
@@ -2371,6 +2392,7 @@ impl<T: Storage> Raft<T> {
         // coexist with the mutable progress borrow taken next.
         let leader_term_at_index = self.raft_log.term(m.index);
 
+        let excluded = self.has_witness() && self.prs.is_excluded_voter(m.from);
         let pr = match self.prs.get_mut(m.from) {
             Some(pr) => pr,
             None => {
@@ -2500,7 +2522,7 @@ impl<T: Storage> Raft<T> {
             if self.should_bcast_commit() {
                 self.bcast_append()
             }
-        } else if old_paused {
+        } else if old_paused && !excluded {
             self.send_append(m.from);
         }
 
@@ -2510,7 +2532,9 @@ impl<T: Storage> Raft<T> {
         // replicate, or when freeTo() covers multiple messages). If
         // we have more entries to send, send as many messages as we
         // can (without sending empty messages for the commit index)
-        self.send_append_aggressively(m.from);
+        if !excluded {
+            self.send_append_aggressively(m.from);
+        }
 
         // Transfer leadership is in progress.
         if Some(m.from) == self.r.lead_transferee {
@@ -2528,6 +2552,7 @@ impl<T: Storage> Raft<T> {
     }
 
     fn handle_heartbeat_response(&mut self, m: &Message) {
+        let excluded = self.has_witness() && self.prs.is_excluded_voter(m.from);
         // Update the node. Drop the value explicitly since we'll check the qourum after.
         let pr = match self.prs.get_mut(m.from) {
             Some(pr) => pr,
@@ -2540,6 +2565,18 @@ impl<T: Storage> Raft<T> {
                 return;
             }
         };
+        // Extended Raft: skip sending append to excluded voters. Their
+        // progress is still tracked but they must not receive entries with
+        // the current subterm (subterm fencing).
+        if excluded {
+            // Still mark recent_active and update committed — the voter may
+            // be recovering and will be swapped back into the replication set
+            // by change_replication_set Case 1 on the next CheckQuorum.
+            pr.update_committed(m.commit);
+            pr.recent_active = true;
+            pr.resume();
+            return;
+        }
         // update followers committed index via heartbeat response
         pr.update_committed(m.commit);
         pr.recent_active = true;

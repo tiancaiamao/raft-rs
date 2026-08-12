@@ -204,9 +204,6 @@ impl Witness {
         }
 
         let _old_term = self.term;
-        let _old_committed_log_term = self.committed_log_term;
-        let _old_committed_log_subterm = self.committed_log_subterm;
-        let _old_replication_set = self.replication_set.clone();
 
         // Update term if needed — only for real votes, not pre-votes.
         // Pre-votes must not advance the witness term; doing so would cause
@@ -278,21 +275,21 @@ impl Witness {
         // a strictly greater term or subterm has already proven its log is more
         // up-to-date, so replication-set membership is irrelevant for those
         // branches.
-        let log_ok = if msg.last_log_term > self.last_log_term {
+        let log_ok = match msg.last_log_term.cmp(&self.last_log_term) {
             // Branch 1: mlastLogTerm > witnessLastLogTerm
-            true
-        } else if msg.last_log_term == self.last_log_term {
-            if msg.last_log_subterm > self.last_log_subterm {
-                // Branch 2: term = ∧ subterm > witnessLastLogSubterm
-                true
-            } else {
-                // Branch 3: term = ∧ subterm ≤
-                //   logOk only when subterm = AND mvotesGranted ⊆ set.
-                msg.last_log_subterm == self.last_log_subterm && replication_set_ok
+            std::cmp::Ordering::Greater => true,
+            std::cmp::Ordering::Equal => {
+                if msg.last_log_subterm > self.last_log_subterm {
+                    // Branch 2: term = ∧ subterm > witnessLastLogSubterm
+                    true
+                } else {
+                    // Branch 3: term = ∧ subterm ≤
+                    //   logOk only when subterm = AND mvotesGranted ⊆ set.
+                    msg.last_log_subterm == self.last_log_subterm && replication_set_ok
+                }
             }
-        } else {
             // term < witnessLastLogTerm
-            false
+            std::cmp::Ordering::Less => false,
         };
 
         // votedFor[WitnessID] ∈ {Nil, j}
@@ -317,29 +314,43 @@ impl Witness {
 
         let grant = log_ok && can_vote;
 
-        #[cfg(feature = "witness-debug")]
-        println!(
-            "WITNESS_DEBUG: handle_vote(is_pre_vote={}) grant={} old_term={} term_now={} \
-             old_committed_log_term={} self_committed_log_term={} \
-             self_committed_log_subterm={} msg_term={} msg_last_log_term={} \
-             msg_last_log_subterm={} log_ok={} can_vote={} replication_set_ok={} \
-             replication_set={:?} vote_ids={:?} vote_vals={:?} commit={}",
+        // Always log vote decisions — this is critical safety information
+        // for post-incident diagnosis. Vote requests are infrequent (only
+        // during elections), so the overhead is negligible.
+        eprintln!(
+            "WITNESS_VOTE: id={} is_pre_vote={} grant={} \
+             term={} msg_term={} msg_from={} \
+             self_last_log_term={} msg_last_log_term={} \
+             self_last_log_subterm={} msg_last_log_subterm={} \
+                         log_ok={} branch={} can_vote={} replication_set_ok={} \
+             replication_set={:?} vote_ids={:?} vote_vals={:?} \
+             committed_log_term={} committed_log_subterm={} commit={}",
+            self.id,
             is_pre_vote,
             grant,
-            _old_term,
             self.term,
-            _old_committed_log_term,
-            self.committed_log_term,
-            self.committed_log_subterm,
             msg.term,
+            msg.from,
+            self.last_log_term,
             msg.last_log_term,
+            self.last_log_subterm,
             msg.last_log_subterm,
             log_ok,
+            match msg.last_log_term.cmp(&self.last_log_term) {
+                std::cmp::Ordering::Greater => "1(term>)",
+                std::cmp::Ordering::Equal if msg.last_log_subterm > self.last_log_subterm => {
+                    "2(subterm>)"
+                }
+                std::cmp::Ordering::Equal => "3(equal)",
+                std::cmp::Ordering::Less => "reject(term<)",
+            },
             can_vote,
             replication_set_ok,
-            _old_replication_set,
+            self.replication_set,
             msg.vote_ids,
             msg.vote_vals,
+            self.committed_log_term,
+            self.committed_log_subterm,
             self.commit,
         );
 

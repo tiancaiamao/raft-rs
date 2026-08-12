@@ -963,6 +963,19 @@ impl ProgressTracker {
         }
     }
 
+    /// Returns true if the given peer is excluded from any replication set.
+    ///
+    /// The leader must not send entries or heartbeats to excluded voters,
+    /// because those entries carry the current subterm. Delivering a higher
+    /// subterm to an excluded voter breaks fencing: the voter could use it
+    /// to win a witness vote (via `handle_vote` Branch 2) before the witness
+    /// has persisted the new subterm via shortcut replication.
+    pub fn is_excluded_voter(&self, id: u64) -> bool {
+        id != 0
+            && (self.epoch.replication_sets[0].excluded == id
+                || self.epoch.replication_sets[1].excluded == id)
+    }
+
     /// Resets the replication set and optionally the subterm counter.
     /// Called when a new leader is elected (reset_subterm=true) or when
     /// a conf change is applied (reset_subterm=false, increment subterm).
@@ -1273,7 +1286,7 @@ struct ScopedAckIndexer<'a> {
     scope: &'a HashSet<u64>,
 }
 
-impl<'a> AckedIndexer for ScopedAckIndexer<'a> {
+impl AckedIndexer for ScopedAckIndexer<'_> {
     fn acked_index(&self, voter_id: u64) -> Option<Index> {
         if !self.scope.contains(&voter_id) {
             return None;
@@ -1301,7 +1314,7 @@ struct ReplicationSetAckIndexer<'a> {
     set: &'a ReplicationSet,
 }
 
-impl<'a> AckedIndexer for ReplicationSetAckIndexer<'a> {
+impl AckedIndexer for ReplicationSetAckIndexer<'_> {
     fn acked_index(&self, voter_id: u64) -> Option<Index> {
         // An excluded witness (steady state) must not contribute an ack: it
         // is not contacted while excluded, so its stale matched index must
