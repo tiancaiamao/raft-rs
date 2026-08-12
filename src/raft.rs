@@ -1598,18 +1598,11 @@ impl<T: Storage> Raft<T> {
     /// - The leader detects liveness changes (new_term=false, conf_change=false)
     ///
     /// Returns true if a new subterm was started (and an empty entry appended).
-    pub fn maybe_start_new_subterm(&mut self, new_term: bool, conf_change: bool) -> bool {
-        if new_term || conf_change {
-            self.mut_prs().reset_replication_set(new_term);
-        } else {
-            let leader_id = self.id;
-            if !self.mut_prs().change_replication_set(leader_id) {
-                return false;
-            }
-        }
-
+    /// Appends a noop entry and logs the new subterm. Called after
+    /// `reset_replication_set` or `change_replication_set` has already
+    /// updated the epoch state.
+    fn finalize_new_subterm(&mut self, trigger: &'static str) {
         if !self.append_entry(&mut [Entry::default()]) {
-            // This won't happen because we just called reset() above.
             panic!("appending an empty entry should never be dropped");
         }
 
@@ -1623,7 +1616,7 @@ impl<T: Storage> Raft<T> {
             "started new subterm";
             "term" => self.term,
             "subterm" => subterm,
-            "trigger" => if new_term { "new_term" } else if conf_change { "conf_change" } else { "liveness" },
+            "trigger" => trigger,
             "r0_witness" => r0.witness,
             "r0_excluded" => r0.excluded,
             "r0_non_witness_voters" => ?r0.non_witness_voters,
@@ -1631,6 +1624,33 @@ impl<T: Storage> Raft<T> {
             "r1_excluded" => r1.excluded,
             "r1_non_witness_voters" => ?r1.non_witness_voters,
         );
+    }
+
+    /// Starts a new subterm by resetting/changing the replication set and
+    /// appending an empty entry. Called when:
+    /// - A new leader is elected (new_term=true, conf_change=false)
+    /// - A conf change is applied (new_term=false, conf_change=true)
+    /// - The leader detects liveness changes (new_term=false, conf_change=false)
+    ///
+    /// Returns true if a new subterm was started (and an empty entry appended).
+    pub fn maybe_start_new_subterm(&mut self, new_term: bool, conf_change: bool) -> bool {
+        if new_term || conf_change {
+            self.mut_prs().reset_replication_set(new_term);
+        } else {
+            let leader_id = self.id;
+            if !self.mut_prs().change_replication_set(leader_id) {
+                return false;
+            }
+        }
+
+        let trigger = if new_term {
+            "new_term"
+        } else if conf_change {
+            "conf_change"
+        } else {
+            "liveness"
+        };
+        self.finalize_new_subterm(trigger);
         true
     }
 
@@ -3579,11 +3599,24 @@ impl<T: Storage> Raft<T> {
         };
         self.prs
             .apply_conf(cfg, changes, self.raft_log.last_index());
-        let new_cs = self.post_conf_change();
-        // Extended Raft: if leader and witnesses are configured,
-        // start a new subterm after conf change.
+
+        // Extended Raft: reset replication sets BEFORE post_conf_change
+        // (which calls maybe_commit). Without this ordering, maybe_commit
+        // sees an inconsistent state where the config is already updated
+        // (e.g. outgoing voters cleared) but replication_sets are stale.
+        // This causes one_less_than_quorum to return u64::MAX for the now-
+        // empty outgoing voter set, which poisons the witness's matched
+        // index via shortcut replication synthesis.
         if self.state == StateRole::Leader && self.has_witness() {
-            self.maybe_start_new_subterm(false, true);
+            self.mut_prs().reset_replication_set(false);
+        }
+
+        let new_cs = self.post_conf_change();
+
+        // Append the noop entry for the new subterm. reset_replication_set
+        // was already called above, so we only need the finalize step.
+        if self.state == StateRole::Leader && self.has_witness() {
+            self.finalize_new_subterm("conf_change");
         }
         Ok(new_cs)
     }
