@@ -49,7 +49,17 @@ fn accept_and_reply(m: &Message) -> Message {
     assert_eq!(m.get_msg_type(), MessageType::MsgAppend);
     let mut reply = new_message(m.to, m.from, MessageType::MsgAppendResponse, 0);
     reply.term = m.term;
-    reply.index = m.index + m.entries.len() as u64;
+    let last_idx = m.index + m.entries.len() as u64;
+    reply.index = last_idx;
+    // Mirror a real follower (handle_append_entries): report the term of the
+    // entry at the acked index and the commit index after appending, so the
+    // leader can verify the ack against its own log.
+    reply.log_term = if m.entries.is_empty() {
+        m.log_term
+    } else {
+        m.entries.last().unwrap().get_term()
+    };
+    reply.commit = m.commit.min(last_idx);
     reply
 }
 
@@ -688,6 +698,8 @@ fn test_follower_check_msg_append() {
         wm.term = 2;
         wm.index = windex;
         wm.commit = w_commit;
+        // A real follower reports the term of the entry at the acked index.
+        wm.log_term = r.raft_log.term(windex).unwrap_or(0);
         if wreject {
             wm.reject = wreject;
             wm.reject_hint = wreject_hint;
@@ -1041,6 +1053,9 @@ fn test_leader_only_commits_log_from_current_term() {
         let mut m = new_message(2, 1, MessageType::MsgAppendResponse, 0);
         m.term = r.term;
         m.index = index;
+        // A real follower reports the term of the entry at the acked index,
+        // which the leader verifies against its own log.
+        m.log_term = r.raft_log.term(m.index).unwrap_or(0);
         r.step(m).expect("");
         if r.raft_log.committed != wcommit {
             panic!(

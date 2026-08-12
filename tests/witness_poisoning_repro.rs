@@ -62,20 +62,6 @@ fn persist_leader_entries(node: &mut RawNode<MemStorage>) {
     node.raft.on_persist_entries(index, term);
 }
 
-fn acknowledge_from_b(node: &mut RawNode<MemStorage>) {
-    let last_index = node.raft.raft_log.last_index();
-    let mut msg = Message {
-        from: B,
-        to: A,
-        term: node.raft.term,
-        index: last_index,
-        log_term: node.raft.raft_log.term(last_index).unwrap_or(0),
-        ..Default::default()
-    };
-    msg.set_msg_type(MessageType::MsgAppendResponse);
-    node.raft.step(msg).unwrap();
-}
-
 fn confirm_witness_append(node: &mut RawNode<MemStorage>, witness_id: u64, req_seq: u64) {
     node.confirm_witness_append(witness_id, req_seq);
 }

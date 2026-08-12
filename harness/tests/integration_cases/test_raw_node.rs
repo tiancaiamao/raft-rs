@@ -897,6 +897,11 @@ fn prepare_async_entries(raw_node: &mut RawNode<MemStorage>, s: &MemStorage) {
     let mut append_response = new_message(2, 1, MessageType::MsgAppendResponse, 0);
     append_response.set_term(2);
     append_response.set_index(2);
+    append_response.log_term = raw_node
+        .raft
+        .raft_log
+        .term(append_response.index)
+        .unwrap_or(0);
     raw_node.step(append_response).unwrap();
 }
 
@@ -1024,6 +1029,11 @@ fn test_raw_node_async_entries_with_leader_change() {
     let mut append_response = new_message(2, 1, MessageType::MsgAppendResponse, 0);
     append_response.set_term(2);
     append_response.set_index(2);
+    append_response.log_term = raw_node
+        .raft
+        .raft_log
+        .term(append_response.index)
+        .unwrap_or(0);
     raw_node.step(append_response).unwrap();
 
     raw_node.raft.become_follower(raw_node.raft.term + 1, 2);
@@ -1328,6 +1338,11 @@ fn test_async_ready_leader() {
     let mut append_response = new_message(2, 1, MessageType::MsgAppendResponse, 0);
     append_response.set_term(2);
     append_response.set_index(first_index + 100);
+    append_response.log_term = raw_node
+        .raft
+        .raft_log
+        .term(append_response.index)
+        .unwrap_or(0);
 
     raw_node.step(append_response).unwrap();
 
@@ -1398,12 +1413,22 @@ fn test_async_ready_leader() {
     let mut append_response = new_message(2, 1, MessageType::MsgAppendResponse, 0);
     append_response.set_term(2);
     append_response.set_index(first_index + 9);
+    append_response.log_term = raw_node
+        .raft
+        .raft_log
+        .term(append_response.index)
+        .unwrap_or(0);
 
     raw_node.step(append_response).unwrap();
 
     let mut append_response = new_message(3, 1, MessageType::MsgAppendResponse, 0);
     append_response.set_term(2);
     append_response.set_index(first_index + 10);
+    append_response.log_term = raw_node
+        .raft
+        .raft_log
+        .term(append_response.index)
+        .unwrap_or(0);
 
     raw_node.step(append_response).unwrap();
 

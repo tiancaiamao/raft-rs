@@ -79,6 +79,7 @@ fn test_msg_app_flow_control_move_forward() {
         // move forward the window
         let mut m = new_message(2, 1, MessageType::MsgAppendResponse, 0);
         m.index = tt as u64;
+        m.log_term = r.raft_log.term(m.index).unwrap_or(0);
         r.step(m).expect("");
         r.read_messages();
 
@@ -97,6 +98,7 @@ fn test_msg_app_flow_control_move_forward() {
         for i in 0..tt {
             let mut m = new_message(2, 1, MessageType::MsgAppendResponse, 0);
             m.index = i as u64;
+            m.log_term = r.raft_log.term(m.index).unwrap_or(0);
             r.step(m).expect("");
             if !r.prs().get(2).unwrap().ins.full() {
                 panic!(
@@ -211,6 +213,7 @@ fn test_msg_app_flow_control_with_freeing_resources() {
 
     let mut resp = new_message(2, 1, MessageType::MsgAppendResponse, 0);
     resp.index = r.raft_log.last_index();
+    resp.log_term = r.raft_log.term(resp.index).unwrap_or(0);
     r.step(resp).unwrap();
 
     assert_eq!(r.prs().get(2).unwrap().ins.count(), 0);
@@ -235,6 +238,7 @@ fn test_msg_app_flow_control_with_freeing_resources() {
 
     let mut resp = new_message(2, 1, MessageType::MsgAppendResponse, 0);
     resp.index = r.raft_log.last_index();
+    resp.log_term = r.raft_log.term(resp.index).unwrap_or(0);
     r.step(resp).unwrap();
 
     assert_eq!(r.prs().get(2).unwrap().ins.count(), 0);

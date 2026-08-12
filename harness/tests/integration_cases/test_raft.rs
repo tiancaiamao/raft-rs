@@ -406,6 +406,7 @@ fn test_progress_flow_control() {
     // send multiple messages at once.
     let mut msg = new_message(2, 1, MessageType::MsgAppendResponse, 0);
     msg.index = ms[0].entries[1].index;
+    msg.log_term = r.raft_log.term(msg.index).unwrap_or(0);
     r.step(msg).unwrap();
     ms = r.read_messages();
     assert_eq!(ms.len(), 3);
@@ -422,6 +423,7 @@ fn test_progress_flow_control() {
     // messages (containing three entries).
     let mut msg = new_message(2, 1, MessageType::MsgAppendResponse, 0);
     msg.index = ms[2].entries[1].index;
+    msg.log_term = r.raft_log.term(msg.index).unwrap_or(0);
     r.step(msg).unwrap();
     ms = r.read_messages();
     assert_eq!(ms.len(), 2);
@@ -1359,7 +1361,11 @@ fn test_handle_heartbeat() {
         m
     };
     let mut tests = vec![
-        (nw(2, 1, 2, commit + 1), commit + 1),
+        // A heartbeat must NOT advance committed: the leader may hold entries
+        // the follower has not matched. The follower reports its actual
+        // committed index in the response; the leader drives catch-up via the
+        // append path (see handle_heartbeat_response).
+        (nw(2, 1, 2, commit + 1), commit),
         (nw(2, 1, 2, commit - 1), commit), // do not decrease commit
     ];
     for (i, (m, w_commit)) in tests.drain(..).enumerate() {
@@ -1425,6 +1431,11 @@ fn test_handle_heartbeat_resp() {
     // Once we have an MsgAppResp, heartbeats no longer send MsgApp.
     let mut m = new_message(2, 0, MessageType::MsgAppendResponse, 0);
     m.index = msgs[0].index + msgs[0].entries.len() as u64;
+    // A real follower reports the term of the acked entry and its own
+    // committed index in the response; the leader relies on the latter to
+    // decide whether the follower has caught up on committed.
+    m.log_term = sm.raft_log.term(m.index).unwrap_or(0);
+    m.commit = sm.raft_log.committed;
     sm.step(m).expect("");
     // Consume the message sent in response to MsgAppResp
     sm.read_messages();
@@ -1496,6 +1507,8 @@ fn test_msg_append_response_wait_reset() {
     // Node 2 acks the first entry, making it committed.
     let mut m = new_message(2, 0, MessageType::MsgAppendResponse, 0);
     m.index = 1;
+    // A real follower reports the term of the entry at the acked index.
+    m.log_term = sm.raft_log.term(m.index).unwrap_or(0);
     sm.step(m).expect("");
     assert_eq!(sm.raft_log.committed, 1);
     // Also consume the MsgApp messages that update Commit on the followers.
@@ -1519,6 +1532,7 @@ fn test_msg_append_response_wait_reset() {
     // Now Node 3 acks the first entry. This releases the wait and entry 2 is sent.
     m = new_message(3, 0, MessageType::MsgAppendResponse, 0);
     m.index = 1;
+    m.log_term = sm.raft_log.term(m.index).unwrap_or(0);
     sm.step(m).expect("");
     msgs = sm.read_messages();
     assert_eq!(msgs.len(), 1);
@@ -2625,6 +2639,9 @@ fn test_leader_append_response() {
         m.term = sm.term;
         m.reject = reject;
         m.reject_hint = index;
+        // A real follower reports the term of the entry at the acked index,
+        // which the leader verifies against its own log.
+        m.log_term = sm.raft_log.term(m.index).unwrap_or(0);
         sm.step(m).expect("");
 
         if sm.prs().get(2).unwrap().matched != wmatch {
@@ -3309,6 +3326,7 @@ fn test_commit_after_remove_node() -> Result<()> {
     // Node 2 acknowledges the config change, committing it.
     let mut msg = new_message(2, 0, MessageType::MsgAppendResponse, 0);
     msg.index = cc_index;
+    msg.log_term = r.raft_log.term(msg.index).unwrap_or(0);
     r.step(msg).expect("");
     let ents = next_ents(&mut r, &s);
     assert_eq!(ents.len(), 2);
@@ -4542,13 +4560,29 @@ fn test_advance_commit_index_by_vote_request(use_prevote: bool) {
         nt.cut(1, 3);
         nt.send(vec![new_message(1, 1, MessageType::MsgPropose, 1)]);
 
-        // let the confchange entry commit but don't let node 4 know
+        // let the confchange entry commit but don't let node 4 know. Node 4
+        // must keep a strictly longer log than node 2 (so it rejects node 2's
+        // later vote), so node 2 must learn the new committed index without
+        // receiving entry idx3: the leader broadcasts a commit-carrying append
+        // once the delayed ack is processed (heartbeats never advance
+        // committed). Node 4 is cut from node 1 and stays behind regardless.
         nt.recover();
         nt.cut(1, 4);
         nt.ignore(MessageType::MsgAppend);
         let mut msg = new_message(2, 1, MessageType::MsgAppendResponse, 0);
         msg.set_index(nt.peers[&2].raft_log.last_index());
-        nt.send(vec![msg, new_message(1, 1, MessageType::MsgBeat, 0)]);
+        msg.log_term = nt.peers[&1].raft_log.term(msg.index).unwrap_or(0);
+        // Commit-only append to node 2, mirroring the leader's broadcast of
+        // the new committed index (entries are filtered above).
+        let mut commit_append = new_message(1, 2, MessageType::MsgAppend, 0);
+        commit_append.index = cc_index;
+        commit_append.log_term = nt.peers[&1].raft_log.term(cc_index).unwrap_or(0);
+        commit_append.commit = cc_index;
+        nt.send(vec![
+            msg,
+            commit_append,
+            new_message(1, 1, MessageType::MsgBeat, 0),
+        ]);
 
         // simulate the leader down
         nt.recover();
@@ -4697,6 +4731,7 @@ fn test_advance_commit_index_by_vote_response(use_prevote: bool) {
         // A delayed MsgAppResp message make the confchange entry become committed
         let mut msg = new_message(2, 1, MessageType::MsgAppendResponse, 0);
         msg.set_index(nt.peers[&2].raft_log.last_index());
+        msg.log_term = nt.peers[&1].raft_log.term(msg.index).unwrap_or(0);
         nt.send(vec![msg, new_message(1, 1, MessageType::MsgBeat, 0)]);
 
         // simulate the leader down
@@ -4952,6 +4987,13 @@ fn test_request_snapshot_matched_change() {
         nt.peers[&1].prs().get(2).unwrap().state,
         ProgressState::Replicate
     );
+
+    // A heartbeat no longer advances the follower's committed index, and a
+    // pending snapshot request makes the follower ignore appends, so its
+    // committed index can only catch up with the matched index through
+    // snapshot restoration. Fast-forward it the way snapshot catch-up would;
+    // the re-request below is then no longer out of order.
+    nt.peers.get_mut(&2).unwrap().raft_log.committed = nt.peers[&1].raft_log.committed;
 
     // Heartbeat is responded with a request snapshot message.
     for _ in 0..nt.peers[&1].heartbeat_timeout() {

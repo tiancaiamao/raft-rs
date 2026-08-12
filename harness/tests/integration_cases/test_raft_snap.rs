@@ -185,6 +185,7 @@ fn test_request_snapshot() {
     // Advance matched.
     let mut m = new_message(2, 1, MessageType::MsgAppendResponse, 0);
     m.index = 11;
+    m.log_term = sm.raft_log.term(m.index).unwrap_or(0);
     sm.step(m).unwrap();
     assert_eq!(sm.prs().get(2).unwrap().state, ProgressState::Replicate);
 
@@ -218,6 +219,7 @@ fn test_request_snapshot() {
     // Append/heartbeats does not set the state from snapshot to probe.
     let mut m = new_message(2, 1, MessageType::MsgAppendResponse, 0);
     m.index = 11;
+    m.log_term = sm.raft_log.term(m.index).unwrap_or(0);
     sm.step(m).unwrap();
     assert_eq!(sm.prs().get(2).unwrap().state, ProgressState::Snapshot);
     assert_eq!(sm.prs().get(2).unwrap().pending_snapshot, 11);
