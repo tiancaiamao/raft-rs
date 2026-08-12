@@ -1344,7 +1344,10 @@ impl<T: Storage> Raft<T> {
         // Log witness-related commit decisions for diagnosis. This captures
         // term/subterm/configuration state at the point of commit advancement,
         // which is essential for debugging 2F1A replication issues.
-        if advanced && self.has_witness() {
+        // Only log when the witness actually participated in this commit
+        // (witness_indices is non-empty); commits that don't involve the
+        // witness would otherwise flood the log on every leader.
+        if advanced && !witness_indices.is_empty() {
             let peer_states: Vec<(u64, u64, u64, bool)> = self
                 .prs()
                 .progress()
