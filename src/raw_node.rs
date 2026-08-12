@@ -485,7 +485,7 @@ impl<T: Storage> RawNode<T> {
                         // replication active) or an append is already in
                         // flight; otherwise retry the send that failed with
                         // LogTemporarilyUnavailable.
-                        if self.raft.prs().epoch.witness_subterm[half] != current_subterm
+                        if !self.raft.is_witness_shortcut_active(half)
                             && self.raft.prs().epoch.witness_pending_subterm[half] == 0
                             && self.raft.send_append_to_witness(to, 0, half)
                         {

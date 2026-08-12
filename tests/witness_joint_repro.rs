@@ -224,6 +224,69 @@ fn isolated_joint_leader_must_not_finish_read_index_without_any_response() {
 }
 
 #[test]
+fn fresh_term_leader_must_not_finish_read_index_via_uncontacted_witness() {
+    let mut node = new_old_config_leader();
+
+    // T0: Commit A's leader no-op through a real response from B. A has met
+    // Raft's normal prerequisite for serving ReadIndex in its current term.
+    // The term is fresh: subterm is still 0 and the witness W1 has never been
+    // contacted or CAS-confirmed in this subterm (witness_subterm == [0, 0]).
+    acknowledge_from_b(&mut node);
+    assert!(node.raft.commit_to_current_term());
+    assert_eq!(node.raft.prs().epoch.subterm, 0);
+    assert_eq!(node.raft.prs().epoch.witness_subterm, [0, 0]);
+    node.raft.read_states.clear();
+    node.raft.msgs.clear();
+
+    // T1: A receives a local ReadIndex request at subterm 0. W1 has NOT
+    // confirmed the current replication set, so it must not be auto-acked —
+    // the naive `witness_subterm == subterm` check would falsely consider
+    // it confirmed because both are 0. With only A's own ack and no response
+    // from B, Safe ReadIndex must remain pending.
+    node.read_index(b"fresh-term-leader".to_vec());
+    assert!(
+        node.raft.read_states.is_empty(),
+        "Safe ReadIndex completed via an uncontacted witness at subterm 0"
+    );
+}
+
+#[test]
+fn confirmed_witness_shortcut_still_serves_read_index_in_degraded_subterm() {
+    let mut node = new_old_config_leader();
+
+    // T0: Commit A's leader no-op through a real response from B.
+    acknowledge_from_b(&mut node);
+    assert!(node.raft.commit_to_current_term());
+
+    // T1: B becomes unreachable. Check-quorum swaps W1 into the replication
+    // set, starting a new (non-zero) subterm and sending W1 an append.
+    let requests = degrade_after_b_failure(&mut node);
+    let w1_request = message_to(&requests, W1);
+    let subterm = node.raft.prs().epoch.subterm;
+    assert!(subterm > 0);
+    assert_eq!(
+        node.raft.prs().epoch.witness_subterm[0],
+        0,
+        "witness must not be considered confirmed before CAS succeeds"
+    );
+
+    // T2: W1's storage CAS succeeds; shortcut replication is now active.
+    node.confirm_witness_append(W1, w1_request.request_seq);
+    assert_eq!(node.raft.prs().epoch.witness_subterm[0], subterm);
+    node.raft.read_states.clear();
+    node.raft.msgs.clear();
+
+    // T3: A receives a local ReadIndex request. W1 has confirmed the current
+    // replication set, so its ack is legitimately synthesized: {A, W1} reaches
+    // quorum (2/3) even without B, and the read must complete.
+    node.read_index(b"degraded-confirmed-witness".to_vec());
+    assert!(
+        !node.raft.read_states.is_empty(),
+        "Safe ReadIndex stalled although a confirmed witness reached quorum"
+    );
+}
+
+#[test]
 fn failure_of_w2_must_not_erase_the_still_active_old_configuration() {
     let mut node = new_old_config_leader();
     enter_joint_replacing_w1_with_w2(&mut node);

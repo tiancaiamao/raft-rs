@@ -965,12 +965,13 @@ impl<T: Storage> Raft<T> {
         // Extended Raft: auto-ack witness for ReadIndex (ReadOnlyOption::Safe),
         // but ONLY when shortcut replication is active for this witness — i.e.
         // the witness has confirmed the current replication set via CAS
-        // (witness_subterm[half] == current_subterm). Before CAS confirmation,
-        // the witness has not persisted the current replication set, so counting
+        // (see `is_witness_shortcut_active`). Before CAS confirmation, the
+        // witness has not persisted the current replication set, so counting
         // it as an ack would risk stale reads if a partitioned peer wins an
-        // election with the witness's vote.
+        // election with the witness's vote. In particular at subterm 0 (a
+        // fresh term) the witness is never auto-acked — reads must wait for
+        // real voter acks.
         if let Some(ref ctx) = ctx {
-            let current_subterm = self.prs().epoch.subterm;
             // Collect witnesses that have confirmed the current replication set
             // via CAS (shortcut replication active). Only these can be auto-acked.
             let eligible_witnesses: Vec<u64> = self
@@ -981,7 +982,7 @@ impl<T: Storage> Raft<T> {
                 .copied()
                 .enumerate()
                 .filter(|(_, w)| *w != 0)
-                .filter(|(h, _)| self.prs().epoch.witness_subterm[*h] == current_subterm)
+                .filter(|(h, _)| self.is_witness_shortcut_active(*h))
                 .map(|(_, w)| w)
                 .collect();
             for wid in eligible_witnesses {
@@ -1006,6 +1007,20 @@ impl<T: Storage> Raft<T> {
     pub(super) fn witness_config_half(&self, witness_id: u64) -> Option<usize> {
         let epoch = &self.prs().epoch;
         (0..2).find(|&i| epoch.replication_sets[i].witness == witness_id)
+    }
+
+    /// Returns true iff the witness in config `half` has CAS-confirmed the
+    /// current replication set (shortcut replication active), so its ack can be
+    /// synthesized for commit/read decisions.
+    ///
+    /// `witness_subterm[half] == subterm` alone is NOT sufficient: at subterm 0
+    /// (a fresh term) both are 0 by reset, which would falsely treat a never-
+    /// contacted witness as confirmed. The `!= 0` check disambiguates the 0
+    /// sentinel (see `confirm_witness_append` — witness_subterm is only ever set
+    /// to the subterm value on CAS success, and reset to 0 on any subterm change).
+    pub(super) fn is_witness_shortcut_active(&self, half: usize) -> bool {
+        let ws = self.prs().epoch.witness_subterm[half];
+        ws != 0 && ws == self.prs().epoch.subterm
     }
 
     /// Called when q-1 voters in the replication set have acknowledged entries
@@ -1260,7 +1275,7 @@ impl<T: Storage> Raft<T> {
             if *idx == 0 {
                 continue;
             }
-            let already_contacted = self.prs().epoch.witness_subterm[*half] == current_subterm;
+            let already_contacted = self.is_witness_shortcut_active(*half);
             let is_pending = self.prs().epoch.witness_pending_subterm[*half] != 0;
 
             if already_contacted {
