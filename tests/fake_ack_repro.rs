@@ -40,10 +40,21 @@ fn logger() -> Logger {
 }
 
 fn make_node(id: u64, entries: Vec<Entry>, hs: HardState) -> RawNode<MemStorage> {
+    make_node_with_witness(id, entries, hs, true)
+}
+
+fn make_node_with_witness(
+    id: u64,
+    entries: Vec<Entry>,
+    hs: HardState,
+    with_witness: bool,
+) -> RawNode<MemStorage> {
     let storage = MemStorage::default();
     let mut cs = ConfState::default();
     cs.set_voters(vec![LEADER_OLD, CANDIDATE, WITNESS]);
-    cs.set_witness(WITNESS);
+    if with_witness {
+        cs.set_witness(WITNESS);
+    }
     storage.initialize_with_conf_state(cs);
     storage.wl().append(&entries).unwrap();
     storage.wl().set_hardstate(hs);
@@ -247,6 +258,56 @@ fn fake_ack_is_rejected_when_acked_term_mismatches_leaders_log() {
         n1594.raft.raft_log.committed, 42,
         "genuine ack commits 42(t10)"
     );
+}
+
+#[test]
+fn termless_append_ack_is_accepted_for_pure_3f() {
+    // A pure 3F configuration must accept an ACK from an old follower, which
+    // does not populate log_term in MsgAppendResponse.
+    let mut leader = make_node_with_witness(
+        CANDIDATE,
+        {
+            let mut log = node1594_log();
+            log.push(entry(42, 10));
+            log
+        },
+        {
+            let mut hs = HardState::default();
+            hs.set_term(9);
+            hs.set_vote(CANDIDATE);
+            hs.set_commit(41);
+            hs
+        },
+        false,
+    );
+    leader.campaign().unwrap();
+
+    let mut vote = Message::default();
+    vote.set_msg_type(MessageType::MsgRequestVoteResponse);
+    vote.from = LEADER_OLD;
+    vote.to = CANDIDATE;
+    vote.term = 10;
+    vote.reject = false;
+    leader.step(vote).unwrap();
+    assert_eq!(leader.raft.state, raft::StateRole::Leader);
+    drain_msgs(&mut leader);
+
+    let mut old_follower_ack = Message::default();
+    old_follower_ack.set_msg_type(MessageType::MsgAppendResponse);
+    old_follower_ack.from = LEADER_OLD;
+    old_follower_ack.to = CANDIDATE;
+    old_follower_ack.term = 10;
+    old_follower_ack.index = 42;
+    old_follower_ack.log_term = 0;
+    old_follower_ack.reject = false;
+    leader.step(old_follower_ack).unwrap();
+
+    assert_eq!(
+        leader.raft.prs().get(LEADER_OLD).unwrap().matched,
+        42,
+        "a pure 3F leader must accept an old follower's term-less ACK"
+    );
+    assert_eq!(leader.raft.raft_log.committed, 42);
 }
 
 #[test]

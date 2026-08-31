@@ -2390,6 +2390,7 @@ impl<T: Storage> Raft<T> {
         // borrow taken next.
         let leader_term_at_index = self.raft_log.term(m.index);
         let committed = self.raft_log.committed;
+        let has_witness = self.has_witness();
 
         let pr = match self.prs.get_mut(m.from) {
             Some(pr) => pr,
@@ -2459,22 +2460,27 @@ impl<T: Storage> Raft<T> {
         // an entry that does not exist in the leader's log (e.g. an empty
         // append whose anchor term was corrupted in transit), and advancing
         // matched would let the leader commit an entry the follower never
-        // replicated. A log_term of 0 means the response carried no term
-        // information (e.g. a snapshot response built without it) — trusting
-        // it would advance matched past the follower's true log position and
-        // pin the leader in an infinite reject loop, so treat it as
-        // inconsistent whenever the leader can verify the acked index.
-        let ack_consistent = match &leader_term_at_index {
-            // The leader's log covers the acked index: require an exact match,
-            // unless the acked index is already committed. An ack for a
-            // committed index cannot advance the leader's commit index past
-            // `committed`, so it is safe to accept even when the leader's log
-            // no longer covers it (e.g. the entries were compacted away); any
-            // lie is caught by the next append probe from index+1.
-            Ok(t) => *t == m.log_term || m.index <= committed,
-            // The acked index is outside the leader's log (truncated, or the
-            // ack is ahead of the log); the leader cannot verify, accept.
-            Err(_) => true,
+        // replicated. In a pure 3F configuration, log_term == 0 is accepted
+        // for compatibility with old followers that do not populate this field.
+        // Configurations with a witness keep the strict check because a
+        // term-less ack cannot be used to validate extended-Raft replication.
+        let ack_consistent = if m.log_term == 0 && !has_witness {
+            true
+        } else {
+            match &leader_term_at_index {
+                // The leader's log covers the acked index: require an exact
+                // match, unless the acked index is already committed. An ack
+                // for a committed index cannot advance the leader's commit
+                // index past `committed`, so it is safe to accept even when
+                // the leader's log no longer covers it (e.g. the entries
+                // were compacted away); any lie is caught by the next append
+                // probe from index+1.
+                Ok(t) => *t == m.log_term || m.index <= committed,
+                // The acked index is outside the leader's log (truncated, or
+                // the ack is ahead of the log); the leader cannot verify,
+                // accept.
+                Err(_) => true,
+            }
         };
         if !ack_consistent {
             warn!(
